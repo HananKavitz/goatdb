@@ -514,13 +514,14 @@ export class Query<
 
   /**
    * Resets the idle close timer on activity. Schedules the one-shot timer
-   * only when no external DocumentChanged listeners are attached (otherwise
-   * the timer is kept unscheduled so a pinned query cannot close).
+   * only when the query has finished loading AND no external DocumentChanged
+   * listeners are attached (otherwise the timer is kept unscheduled so a
+   * pinned or still-loading query cannot close).
    */
   _touchIdle(): void {
     if (this._idleTimer && !this._closed) {
       this._idleTimer.unschedule();
-      if (this.listenerCount('DocumentChanged') === 0) {
+      if (!this._loading && this.listenerCount('DocumentChanged') === 0) {
         this._idleTimer.schedule();
       }
     }
@@ -716,30 +717,18 @@ export class Query<
    * live-updates listener, but GC timing is non-deterministic.
    */
   /**
-   * Minimal overrides that keep the idle timer in sync with DocumentChanged
-   * listeners. Eligibility is derived from Emitter own registrations (no
-   * parallel counter), so detachAll, dedup, and missing-detach semantics are
-   * always correct. Other events pass through unchanged.
+   * Single hook from Emitter: react to listener changes (attach, detach,
+   * detachAll) without overriding each method individually.
+   * Covers DocumentChanged to keep the idle timer in sync.
    */
-  // deno-lint-ignore ban-types
-  override attach<C extends Function, E extends string>(
-    e: E,
-    c: C,
-  ): () => void {
-    const unsub = super.attach(e as any, c);
-    if (e === 'DocumentChanged') {
-      // Pinned while listeners exist -> keep the idle timer unscheduled.
-      this._idleTimer?.unschedule();
-    }
-    return unsub;
-  }
-
-  // deno-lint-ignore ban-types
-  override detach<C extends Function, E extends string>(e: E, c: C): void {
-    super.detach(e as any, c as any);
-    if (e === 'DocumentChanged') {
-      // Re-arm the idle timer only once the last external listener is gone.
-      this._touchIdle();
+  protected override _onListenersChanged(event: string | undefined): void {
+    if (event === 'DocumentChanged') {
+      const count = this.listenerCount('DocumentChanged');
+      if (count > 0) {
+        this._idleTimer?.unschedule();
+      } else {
+        this._touchIdle();
+      }
     }
   }
 
@@ -988,6 +977,7 @@ export class Query<
       this._scanTimeMs = performance.now() - startTime;
       if (!this._loadingFinished) {
         this._loadingFinished = true;
+        this._loading = false;
         // Schedule idle close timer if no external listeners
         if (this._idleTimer && this.listenerCount('DocumentChanged') === 0) {
           this._touchIdle();
@@ -995,7 +985,6 @@ export class Query<
         this.repo.db.queryPersistence?.register(
           this as unknown as Query<Schema, Schema, ReadonlyJSONValue>,
         );
-        this._loading = false;
         this.emit('LoadingFinished');
       }
       return;
@@ -1040,6 +1029,7 @@ export class Query<
         this._age = Math.max(this._age, maxAge);
         if (!this._loadingFinished) {
           this._loadingFinished = true;
+          this._loading = false;
           // Schedule idle close timer if no external listeners
           if (this._idleTimer && this.listenerCount('DocumentChanged') === 0) {
             this._touchIdle();
@@ -1048,7 +1038,6 @@ export class Query<
             this as unknown as Query<Schema, Schema, ReadonlyJSONValue>,
           );
           await this.repo.db.queryPersistence?.flush(this.repo.path);
-          this._loading = false;
           this.emit('LoadingFinished');
         }
       }

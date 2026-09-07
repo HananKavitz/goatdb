@@ -266,6 +266,8 @@ export class GoatDB<US extends Schema = Schema>
   >();
   /** In-flight repo closes, keyed by repoId (serializes open/close). */
   private readonly _closePromises = new Map<string, Promise<void>>();
+  /** Mutex guard against concurrent manual closeRepo() calls for the same repo. */
+  private readonly _closeLocks = new Set<string>();
   private _path: string | undefined;
   private _settingsProvider: DBSettingsProvider | undefined;
   queryPersistence?: QueryPersistence;
@@ -451,14 +453,35 @@ export class GoatDB<US extends Schema = Schema>
       await this.closeRepo(repoPath);
     }
 
+    // Commit all remaining items (auto-closed repos). Items from
+    // closeRepo'd repos were already removed from _items. The commit
+    // reopens auto-closed repos via acquireRepo. After this, close any
+    // repos still in _repositories (reopened by this loop or by timer
+    // callbacks that fired during closeRepo).
+    const pendingRepos = new Set<string>();
+    for (const item of [...this._items.values()]) {
+      const repoId = itemPathGetRepoId(item.path);
+      try {
+        await (item as any).commit();
+      } catch (e) {
+        // ignore
+      }
+      if (this._repositories.has(repoId)) {
+        pendingRepos.add(repoId);
+      }
+    }
+    for (const repoId of pendingRepos) {
+      await this.closeRepo(repoId);
+    }
+
     // Clear query persistence (has flush timer)
     if (this.queryPersistence) {
       await this.queryPersistence.close();
       this.queryPersistence = undefined;
     }
 
-    // Deactivate any leftover managed items (e.g. from auto-closed repos) so
-    // their pending commit timers cannot reopen a repo after teardown.
+    // Deactivate any leftover managed items so their pending commit timers
+    // cannot reopen a repo after teardown.
     for (const item of this._items.values()) {
       (item as any).deactivate();
     }
@@ -547,45 +570,57 @@ export class GoatDB<US extends Schema = Schema>
   async closeRepo(path: string): Promise<void> {
     path = itemPathNormalize(path);
     const repoId = itemPathGetRepoId(path);
-    // Wait for any in-flight open (do not close a half-loaded repo).
-    const openP = this._openPromises.get(repoId);
-    if (openP) await openP;
-    // Serialize: if a close is already in flight, wait for it and return.
-    const inFlight = this._closePromises.get(repoId);
-    if (inFlight) {
-      await inFlight;
+    // Mutex: acquire the lock synchronously before any await.
+    if (this._closeLocks.has(repoId)) {
+      // Another call is already processing; wait for it via the promise.
+      const p = this._closePromises.get(repoId);
+      if (p) await p;
       return;
     }
-    const repo = this.repository(repoId);
-    if (!repo || repo._closeState !== 'open') {
-      return;
-    }
-    // Unschedule idle timer so it cannot fire during the close.
-    (repo as any)._idleTimer?.unschedule();
-    // Tear down dependent queries (manual close owns this; auto-close never
-    // reaches here with queries attached because listener pins prevent it).
-    this._closeDependentQueries(repoId);
-    // Commit pending item edits before tearing down file handles. This goes
-    // through item.commit() -> acquireRepo -> open(), which returns THIS same
-    // 'open' repo (state stays 'open' until after commits), so no replacement
-    // repo is created -- the auto-close race is eliminated.
-    await this._commitDependentItems(repo);
-    for (const k of [...this._items.keys()]) {
-      const item = this._items.get(k);
-      if (item && item.repository === repo) {
-        item.deactivate();
-        this._items.delete(k);
-      }
-    }
-    // Transition to Closing and tear down.
-    repo._closeState = 'closing';
-    const cp = this._tearDownRepo(repo);
-    this._closePromises.set(repoId, cp);
+    this._closeLocks.add(repoId);
     try {
-      await cp;
+      // Wait for any in-flight open (do not close a half-loaded repo).
+      const openP = this._openPromises.get(repoId);
+      if (openP) await openP;
+      // Serialize: if a close is already in flight, wait for it and return.
+      const inFlight = this._closePromises.get(repoId);
+      if (inFlight) {
+        await inFlight;
+        return;
+      }
+      const repo = this.repository(repoId);
+      if (!repo || repo._closeState !== 'open') {
+        return;
+      }
+      // Unschedule idle timer so it cannot fire during the close.
+      (repo as any)._idleTimer?.unschedule();
+      // Tear down dependent queries (manual close owns this; auto-close never
+      // reaches here with queries attached because listener pins prevent it).
+      this._closeDependentQueries(repoId);
+      // Commit pending item edits before tearing down file handles. This goes
+      // through item.commit() -> acquireRepo -> open(), which returns THIS same
+      // 'open' repo (state stays 'open' until after commits), so no replacement
+      // repo is created -- the auto-close race is eliminated.
+      await this._commitDependentItems(repo);
+      for (const k of [...this._items.keys()]) {
+        const item = this._items.get(k);
+        if (item && item.repository === repo) {
+          item.deactivate();
+          this._items.delete(k);
+        }
+      }
+      // Transition to Closing and tear down.
+      repo._closeState = 'closing';
+      const cp = this._tearDownRepo(repo);
+      this._closePromises.set(repoId, cp);
+      try {
+        await cp;
+      } finally {
+        this._closePromises.delete(repoId);
+        repo._closeState = 'closed';
+      }
     } finally {
-      this._closePromises.delete(repoId);
-      repo._closeState = 'closed';
+      this._closeLocks.delete(repoId);
     }
   }
 

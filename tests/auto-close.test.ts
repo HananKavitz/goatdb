@@ -728,6 +728,234 @@ export default function setup(): void {
   });
 
   // ════════════════════════════════════════════════════════════════
+  // Part 6: Listener & detachAll Coverage
+  // ════════════════════════════════════════════════════════════════
+
+  TEST(
+    'AutoClose',
+    'detachAll(DocumentChanged) re-arms idle timer',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-detachall', {
+        registry: kRegistry,
+        repoInactivityTimeoutMs: 100,
+      });
+      try {
+        await db.readyPromise();
+        const repo = await db.open('/data/items');
+        // Attach a listener that pins the repo open
+        const unsub = repo.attach('DocumentChanged', () => {});
+        await p(repo)._testTriggerIdleTimeout();
+        assertTrue(
+          p(db)._repositories.has('/data/items'),
+          'listener pins repo before detachAll',
+        );
+
+        // detachAll('DocumentChanged') must re-arm the timer via
+        // _onListenersChanged, unlike the old attach/detach overrides that
+        // detachAll bypassed.
+        repo.detachAll('DocumentChanged');
+        await p(repo)._testTriggerIdleTimeout();
+        assertEquals(
+          p(db)._repositories.has('/data/items'),
+          false,
+          'detachAll re-arms timer and repo closes',
+        );
+      } finally {
+        await db.close();
+      }
+    },
+  );
+
+  // ════════════════════════════════════════════════════════════════
+  // Part 7: Query Loading Guard (no auto-close mid-load)
+  // ════════════════════════════════════════════════════════════════
+
+  TEST(
+    'AutoClose',
+    'loading query is not eligible for idle close',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-loading-guard', {
+        registry: kRegistry,
+        queryInactivityTimeoutMs: 100,
+      });
+      try {
+        await db.readyPromise();
+        const q = db.query({
+          source: '/data/items',
+          predicate: () => true,
+          schema: kAutoCloseSchema,
+        });
+        // _touchIdle is called by accessors even while loading.
+        // It must NOT schedule the timer when _loading is true.
+        q.has('/data/items/nonexistent');
+        // The timer arm was skipped because _loading === true.
+        // Verify by checking that no close happens (query still in map).
+        assertTrue(p(db)._openQueries.has(q.id), 'query open during load');
+        await q.loadingFinished();
+        // After loading finishes, the timer arms on next accessor call.
+        // The query has no external listeners -> eligible for close.
+        await p(q)._testTriggerIdleTimeout();
+        assertEquals(
+          p(db)._openQueries.has(q.id),
+          false,
+          'query closes after loading done + idle',
+        );
+      } finally {
+        await db.close();
+      }
+    },
+  );
+
+  // ════════════════════════════════════════════════════════════════
+  // Part 8: Concurrent closeRepo Mutex
+  // ════════════════════════════════════════════════════════════════
+
+  TEST(
+    'AutoClose',
+    'concurrent manual closeRepo calls do not race',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-close-race', {
+        registry: kRegistry,
+      });
+      try {
+        await db.readyPromise();
+        await db.open('/data/items');
+        // Fire off two concurrent closeRepo calls. The second must be
+        // blocked by the mutex (not double-destroy the repo).
+        const [r1, r2] = await Promise.allSettled([
+          db.closeRepo('/data/items'),
+          db.closeRepo('/data/items'),
+        ]);
+        assertEquals(r1.status, 'fulfilled', 'first closeRepo ok');
+        assertEquals(r2.status, 'fulfilled', 'second closeRepo ok (noop)');
+        assertEquals(
+          p(db)._repositories.has('/data/items'),
+          false,
+          'repo closed after concurrent calls',
+        );
+      } finally {
+        await db.close();
+      }
+    },
+  );
+
+  // ════════════════════════════════════════════════════════════════
+  // Part 9: Idle Lease in Write Path
+  // ════════════════════════════════════════════════════════════════
+
+  TEST(
+    'AutoClose',
+    'repo.setValueForKey acquires idle lease to prevent mid-write close',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-lease-write', {
+        registry: kRegistry,
+        repoInactivityTimeoutMs: 100,
+      });
+      try {
+        await db.readyPromise();
+        await db.open('/data/items');
+        const repo = p(db).repository('/data/items');
+        assertExists(repo);
+
+        // Call setValueForKey directly (no await boundary).
+        // Inside setValueForKey the lease is acquired synchronously.
+        const Item = (await import('../cfds/base/item.ts')).Item;
+        const testItem = new Item(
+          { schema: kAutoCloseSchema, data: { value: 'written-during-lease' } },
+          kRegistry,
+        );
+        const writeP = (repo as any).setValueForKey('test-key', testItem, undefined);
+
+        // The lease was acquired synchronously inside setValueForKey.
+        await p(repo)._testTriggerIdleTimeout();
+        assertTrue(
+          p(db)._repositories.has('/data/items'),
+          'repo pinned by write lease',
+        );
+        await writeP;
+
+        // After write completes, lease is released. Now close is possible.
+        await p(repo)._testTriggerIdleTimeout();
+        assertEquals(
+          p(db)._repositories.has('/data/items'),
+          false,
+          'repo closes after write completes',
+        );
+
+        // Open again and verify data persisted.
+        const repo2 = await db.open('/data/items');
+        assertExists(repo2);
+        const val = repo2.valueForKey('test-key');
+        assertExists(val, 'valueForKey returns data');
+        assertEquals(val[0].get('value'), 'written-during-lease');
+      } finally {
+        await db.flushAll();
+        await db.close();
+      }
+    },
+  );
+
+  // ════════════════════════════════════════════════════════════════
+  // Part 10: db.close() Commits Dirty Items from Auto-Closed Repos
+  // ════════════════════════════════════════════════════════════════
+
+  TEST(
+    'AutoClose',
+    'close() commits pending edits from auto-closed repos',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-close-dirty', {
+        registry: kRegistry,
+        repoInactivityTimeoutMs: 100,
+      });
+      try {
+        await db.readyPromise();
+        const item = db.create('/data/items/pending', kAutoCloseSchema, {
+          value: 'initial',
+        });
+        await item.commit();
+        await db.flush('/data/items');
+
+        // Auto-close the repo.
+        const repo = p(db).repository('/data/items');
+        if (repo) await p(repo)._testTriggerIdleTimeout();
+        assertEquals(
+          p(db)._repositories.has('/data/items'),
+          false,
+          'repo auto-closed',
+        );
+
+        // Make a dirty (uncommitted) edit.
+        item.set('value', 'dirty-but-saved');
+
+        // close() must commit the dirty edit before deactivating.
+        await db.close();
+
+        // Reopen the DB at the SAME path and verify the pending edit was
+        // committed. Use the same testId so createDB returns the same dir.
+        const db2 = await ctx.createDB('ac-close-dirty', {
+          registry: kRegistry,
+          repoInactivityTimeoutMs: 0,
+        });
+        try {
+          await db2.readyPromise();
+          // Open the repo manually since item() doesn't open automatically
+          await db2.open('/data/items');
+          const item2 = db2.item('/data/items/pending');
+          assertEquals(
+            item2.get('value'),
+            'dirty-but-saved',
+            'pending edit persisted across close()',
+          );
+        } finally {
+          await db2.close();
+        }
+      } finally {
+        await db.close();
+      }
+    },
+  );
+
+  // ════════════════════════════════════════════════════════════════
   // E2E: Real Timer (scheduler integration only)
   // ════════════════════════════════════════════════════════════════
   if (!isBrowser()) {

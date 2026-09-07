@@ -159,6 +159,7 @@ export class Emitter<T extends string> {
       this.emit('resumed');
     }
     this._isActive = this.calcIsActive();
+    this._onListenersChanged(e as T);
     return () => this.detach(e, c);
   }
 
@@ -200,6 +201,7 @@ export class Emitter<T extends string> {
       arr.splice(idx, 1);
       this._isActive = this.calcIsActive();
     }
+    this._onListenersChanged(e as T);
   }
 
   detachAll<E extends T | EmitterEvent>(e?: E): void {
@@ -227,6 +229,7 @@ export class Emitter<T extends string> {
           this.emit('suspended');
         }
       }
+      this._onListenersChanged(undefined);
       return;
     }
     if (e === 'EmitterSuspended' || e === 'EmitterResumed') {
@@ -259,6 +262,7 @@ export class Emitter<T extends string> {
         this.emit('suspended');
       }
     }
+    this._onListenersChanged(e as T);
   }
 
   // deno-lint-ignore ban-types
@@ -297,6 +301,15 @@ export class Emitter<T extends string> {
       }
     }
   }
+
+  /**
+   * Hook called whenever listeners change for a specific event (attach, detach,
+   * or detachAll with a specific event). Override in subclasses to react to
+   * listener changes (e.g. re-arm idle timers) without overriding attach/detach
+   * individually. The event argument is the event whose listener set changed,
+   * or undefined for detachAll() with no argument.
+   */
+  protected _onListenersChanged(_event: string | undefined): void {}
 
   protected suspend(): void {}
 

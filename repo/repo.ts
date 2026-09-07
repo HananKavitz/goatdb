@@ -296,26 +296,18 @@ export class Repository<
   }
 
   /**
-   * Minimal overrides that keep the idle timer in sync with DocumentChanged
-   * listeners derived from Emitter registrations (no parallel counter).
-   * Other events pass through unchanged.
+   * Single hook from Emitter: react to listener changes (attach, detach,
+   * detachAll) without overriding each method individually.
+   * Covers DocumentChanged to keep the idle timer in sync.
    */
-  // deno-lint-ignore ban-types
-  override attach<C extends Function, E extends string>(
-    e: E,
-    c: C,
-  ): () => void {
-    const unsub = super.attach(e as any, c as any);
-    if (e === 'DocumentChanged') {
-      this._idleTimer?.unschedule();
-    }
-    return unsub;
-  }
-  // deno-lint-ignore ban-types
-  override detach<C extends Function, E extends string>(e: E, c: C): void {
-    super.detach(e as any, c as any);
-    if (e === 'DocumentChanged') {
-      this._touchIdle();
+  protected override _onListenersChanged(event: string | undefined): void {
+    if (event === 'DocumentChanged') {
+      const count = this.listenerCount('DocumentChanged');
+      if (count > 0) {
+        this._idleTimer?.unschedule();
+      } else {
+        this._touchIdle();
+      }
     }
   }
 
@@ -1265,14 +1257,23 @@ export class Repository<
       itemPathIsValid(itemPathJoin(this.path, key)),
       `Invalid key: ${key}`,
     );
+    // Acquire the lease synchronously (before any microtask) so an idle
+    // close cannot slip in between setValueForKey returning and the async
+    // impl starting.
+    this.acquireIdleLease();
     if (this._pendingCommitPromises.has(key)) {
-      // Refuse editing while an existing edit is in progress
+      // Refuse editing while an existing edit is in progress.
+      // Release the lease immediately since no impl will run.
+      this.releaseIdleLease();
       throw serviceUnavailable();
     }
     this._pendingCommitPromises.set(
       key,
       this._setValueForKeyImpl(key, value, parentCommit).finally(() => {
         this._pendingCommitPromises.delete(key);
+        // Release the idle lease after the impl completes (success or
+        // failure), so auto-close is re-enabled.
+        this.releaseIdleLease();
       }),
     );
     return this._pendingCommitPromises.get(key);
@@ -1344,54 +1345,61 @@ export class Repository<
    */
   async insert(entries: { key: string; value: Item }[]): Promise<Commit[]> {
     this._touchIdle();
-    const session = this.trustPool.currentSession;
-    const newEntries: { key: string; value: Item }[] = [];
-    const existingPromises: Promise<Commit | undefined>[] = [];
+    // Hold an idle lease during the bulk write so an auto-close cannot tear
+    // down the repo between commits.
+    this.acquireIdleLease();
+    try {
+      const session = this.trustPool.currentSession;
+      const newEntries: { key: string; value: Item }[] = [];
+      const existingPromises: Promise<Commit | undefined>[] = [];
 
-    for (const entry of entries) {
-      if (this.valueForKey(entry.key)) {
-        existingPromises.push(
-          this.setValueForKey(entry.key, entry.value, undefined),
+      for (const entry of entries) {
+        if (this.valueForKey(entry.key)) {
+          existingPromises.push(
+            this.setValueForKey(entry.key, entry.value, undefined),
+          );
+        } else {
+          newEntries.push(entry);
+        }
+      }
+
+      // Build root commits for new keys — safe to skip ancestor computation
+      // and delta compression because these are the first commit per key.
+      const commits: Commit[] = [];
+      for (const { key, value } of newEntries) {
+        commits.push(
+          Commit.create({
+            session: session.id,
+            key,
+            contents: value,
+            ancestors: [],
+            orgId: this.orgId,
+          }),
         );
-      } else {
-        newEntries.push(entry);
       }
-    }
 
-    // Build root commits for new keys — safe to skip ancestor computation
-    // and delta compression because these are the first commit per key.
-    const commits: Commit[] = [];
-    for (const { key, value } of newEntries) {
-      commits.push(
-        Commit.create({
-          session: session.id,
-          key,
-          contents: value,
-          ancestors: [],
-          orgId: this.orgId,
-        }),
-      );
-    }
-
-    // Sign sequentially (avoids 100k microtask scheduling from Promise.all)
-    if (!this.db.trusted) {
-      for (let i = 0; i < commits.length; i++) {
-        commits[i] = await signCommit(session, commits[i]);
+      // Sign sequentially (avoids 100k microtask scheduling from Promise.all)
+      if (!this.db.trusted) {
+        for (let i = 0; i < commits.length; i++) {
+          commits[i] = await signCommit(session, commits[i]);
+        }
       }
-    }
 
-    // Persist in one batch
-    if (commits.length > 0) {
-      await this.persistVerifiedCommits(commits);
-    }
+      // Persist in one batch
+      if (commits.length > 0) {
+        await this.persistVerifiedCommits(commits);
+      }
 
-    // Await fallback for existing keys
-    const existingResults = await Promise.all(existingPromises);
-    for (const c of existingResults) {
-      if (c) commits.push(c);
-    }
+      // Await fallback for existing keys
+      const existingResults = await Promise.all(existingPromises);
+      for (const c of existingResults) {
+        if (c) commits.push(c);
+      }
 
-    return commits;
+      return commits;
+    } finally {
+      this.releaseIdleLease();
+    }
   }
 
   /**

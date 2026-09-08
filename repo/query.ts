@@ -270,9 +270,10 @@ export class Query<
   private _liveUpdates: boolean;
   private _resultsGeneration: number = 0;
   private _repoPrefix: string | undefined;
-  private _closed = false;
+  /** @internal Closed flag -- public so lifecycle code can check without casts. */
+  _closed = false;
   /** @internal One-shot idle close timer. */
-  private _idleTimer: SimpleTimer | undefined;
+  _idleTimer: SimpleTimer | undefined;
   private _cachedResults: ManagedItem<OS>[] | undefined;
   private _cachedResultsAge = -1;
   private _loading: boolean = true;
@@ -722,7 +723,9 @@ export class Query<
    * Covers DocumentChanged to keep the idle timer in sync.
    */
   protected override _onListenersChanged(event: string | undefined): void {
-    if (event === 'DocumentChanged') {
+    // Handle both specific 'DocumentChanged' changes and bare detachAll()
+    // (which passes undefined). In either case, re-evaluate the idle state.
+    if (event === 'DocumentChanged' || event === undefined) {
       const count = this.listenerCount('DocumentChanged');
       if (count > 0) {
         this._idleTimer?.unschedule();
@@ -732,6 +735,15 @@ export class Query<
     }
   }
 
+  /**
+   * Closes this query, releasing its memory and unregistering from persistence.
+   * Also releases the query's DocumentChanged listener on its source repo,
+   * which may make the source repo eligible for auto-close.
+   *
+   * After close(), the query stops tracking updates and `results()` returns
+   * the snapshot captured at close time. Calling any method on a closed
+   * query is undefined behavior.
+   */
   close(): void {
     if (!this._closed) {
       this._closed = true;

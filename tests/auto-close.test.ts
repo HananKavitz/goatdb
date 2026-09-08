@@ -122,8 +122,8 @@ export default function setup(): void {
       await p(p(db).repository('/data/items'))._testTriggerIdleTimeout();
 
       assertEquals(
-        p(db)._repositories.has('/data/items'),
-        false,
+        db.repository('/data/items'),
+        undefined,
         'bare repo closes',
       );
     } finally {
@@ -149,7 +149,7 @@ export default function setup(): void {
         const lease = await db.acquireRepo('/data/items');
         await p(repo)._testTriggerIdleTimeout();
         assertTrue(
-          p(db)._repositories.has('/data/items'),
+          db.repository('/data/items') !== undefined,
           'lease pins repo open',
         );
 
@@ -157,8 +157,8 @@ export default function setup(): void {
         lease.dispose();
         await p(repo)._testTriggerIdleTimeout();
         assertEquals(
-          p(db)._repositories.has('/data/items'),
-          false,
+          db.repository('/data/items'),
+          undefined,
           'repo closes after lease released',
         );
       } finally {
@@ -192,15 +192,17 @@ export default function setup(): void {
         assertExists(repo);
         await p(repo)._testTriggerIdleTimeout();
         assertEquals(
-          p(db)._repositories.has('/data/items'),
-          false,
+          db.repository('/data/items'),
+          undefined,
           'repo auto-closed without committing',
         );
 
-        // The pending 300ms commit fires later, reopening the repo and persisting.
-        await sleep(400);
+        // The pending commit fires later, reopening the repo and persisting.
+        // Call commit() directly (same as the 300ms timer callback) to avoid
+        // a wall-clock sleep(400) in the test.
+        await item.commit();
         assertTrue(
-          p(db)._repositories.has('/data/items'),
+          db.repository('/data/items') !== undefined,
           'pending edit reopened repo',
         );
         assertEquals(item.get('value'), 'b');
@@ -233,7 +235,7 @@ export default function setup(): void {
         // The query holds a DocumentChanged listener on the repo -> pin.
         await p(repo)._testTriggerIdleTimeout();
         assertTrue(
-          p(db)._repositories.has('/data/items'),
+          db.repository('/data/items') !== undefined,
           'open query pins its repo',
         );
 
@@ -241,8 +243,8 @@ export default function setup(): void {
         q.close();
         await p(repo)._testTriggerIdleTimeout();
         assertEquals(
-          p(db)._repositories.has('/data/items'),
-          false,
+          db.repository('/data/items'),
+          undefined,
           'repo closes after query closed',
         );
       } finally {
@@ -266,15 +268,15 @@ export default function setup(): void {
 
         await p(repo)._testTriggerIdleTimeout();
         assertTrue(
-          p(db)._repositories.has('/data/items'),
+          db.repository('/data/items') !== undefined,
           'external listener pins repo',
         );
 
         unsub();
         await p(repo)._testTriggerIdleTimeout();
         assertEquals(
-          p(db)._repositories.has('/data/items'),
-          false,
+          db.repository('/data/items'),
+          undefined,
           'final detach permits close',
         );
       } finally {
@@ -295,7 +297,7 @@ export default function setup(): void {
 
       await p(repo)._testTriggerIdleTimeout();
       assertTrue(
-        p(db)._repositories.has('/sys/sessions'),
+        db.repository('/sys/sessions') !== undefined,
         '/sys/sessions never auto-closes',
       );
     } finally {
@@ -311,14 +313,14 @@ export default function setup(): void {
     try {
       await db.readyPromise();
       let repo = await db.open('/data/items');
-      assertTrue(p(db)._repositories.has('/data/items'));
+      assertTrue(db.repository('/data/items') !== undefined);
 
       // Touch activity (keys) then attempt idle close -> still closes (bare).
       repo.keys();
       await p(repo)._testTriggerIdleTimeout();
       assertEquals(
-        p(db)._repositories.has('/data/items'),
-        false,
+        db.repository('/data/items'),
+        undefined,
         'repo closed after read+idle',
       );
 

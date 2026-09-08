@@ -135,16 +135,14 @@ export class Repository<
   private readonly _concurrency: number;
   private readonly _authInfoPool: AuthRuleInfo[];
   /** @internal One-shot idle close timer (scheduled only after open completes). */
-  private _idleTimer: SimpleTimer | undefined;
-  /**
-   * @internal Close lifecycle state. Serializes Open -> Closing -> Closed so
-   * that db.open() during a close awaits the in-flight close then reopens,
-   * and so an idle timer cannot fire on a half-initialized repo.
-   */
+  _idleTimer: SimpleTimer | undefined;
+  /** @internal Close lifecycle state. db.open() and auto-close check this
+   * before transitioning; combined with _closePromises in GoatDB for
+   * await-based serialization of Open -> Closing -> Closed. */
   _closeState: 'open' | 'closing' | 'closed' = 'open';
   /** @internal Active idle leases (e.g. in-flight item commits via acquireRepo). */
   _idleLeaseCount = 0;
-  /** @internal Guards timer scheduling until _openImpl completes (no slow-open expiry). */
+  /** Guards timer scheduling until _openImpl completes (no slow-open expiry). */
   private _idleReady = false;
 
   constructor(
@@ -275,14 +273,14 @@ export class Repository<
     if (this._closeState !== 'open') return false;
     if (this._idleLeaseCount > 0) return false;
     if (this.listenerCount('DocumentChanged') > 0) return false;
+    // System repos are never auto-closed
+    if (this.path.startsWith('/sys/') || this.path === '/sys') return false;
     return true;
   }
 
   /** @internal Called by the idle timer to request close. */
   _onIdleTimeout(): void {
     if (!this._isIdleEligible()) return;
-    // System repos are never auto-closed
-    if (this.path.startsWith('/sys/') || this.path === '/sys') return;
     this.db._requestRepoIdleClose(this as any);
   }
 
@@ -290,8 +288,6 @@ export class Repository<
   async _testTriggerIdleTimeout(): Promise<void> {
     this._idleTimer?.unschedule();
     if (!this._isIdleEligible()) return;
-    // System repos are never auto-closed
-    if (this.path.startsWith('/sys/') || this.path === '/sys') return;
     await this.db._requestRepoIdleClose(this as any);
   }
 
@@ -301,7 +297,9 @@ export class Repository<
    * Covers DocumentChanged to keep the idle timer in sync.
    */
   protected override _onListenersChanged(event: string | undefined): void {
-    if (event === 'DocumentChanged') {
+    // Handle both specific 'DocumentChanged' changes and bare detachAll()
+    // (which passes undefined). In either case, re-evaluate the idle state.
+    if (event === 'DocumentChanged' || event === undefined) {
       const count = this.listenerCount('DocumentChanged');
       if (count > 0) {
         this._idleTimer?.unschedule();

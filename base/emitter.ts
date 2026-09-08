@@ -188,6 +188,7 @@ export class Emitter<T extends string> {
     if (this._dispatching > 0) {
       (arr as (EmitterCallback | null)[])[idx] = null;
       this._dispatchDirty = true;
+      this._onListenersChanged(e as T);
       return;
     }
     if (arr.length === 1) {
@@ -217,6 +218,7 @@ export class Emitter<T extends string> {
           (this._resumeCallbacks as (EmitterCallback | null)[])[i] = null;
         }
         this._dispatchDirty = true;
+        this._onListenersChanged(undefined);
         return;
       }
       this._suspendCallbacks = [];
@@ -253,6 +255,7 @@ export class Emitter<T extends string> {
       if (this._dispatching > 0) {
         for (let i = 0; i < callbacks!.length; i++) callbacks![i] = null;
         this._dispatchDirty = true;
+        this._onListenersChanged(e as T);
         return;
       }
       this._callbacks.delete(e);

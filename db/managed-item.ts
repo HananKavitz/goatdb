@@ -391,6 +391,21 @@ export class ManagedItem<S extends Schema = Schema, US extends Schema = Schema>
   }
 
   /**
+   * @internal Test-only: trigger the delayed commit immediately, bypassing
+   * the 300ms delay timer. Returns the commit promise so callers can await
+   * completion. Does nothing if no commit is pending.
+   */
+  _testTriggerDelayedCommit(): Promise<void> | undefined {
+    if (this._commitPromise) {
+      // A commit is already in flight or scheduled; unschedule the timer and
+      // return the existing promise (the impl will complete on its own).
+      this._commitDelayTimer.unschedule();
+      return this._commitPromise;
+    }
+    return undefined;
+  }
+
+  /**
    * Handles changes to the managed item by incrementing its age, emitting a
    * change event, and scheduling a commit.
    *
@@ -416,8 +431,9 @@ export class ManagedItem<S extends Schema = Schema, US extends Schema = Schema>
       const repoId = itemPathGetRepoId(this.path);
       // Acquire an open repo + idle lease atomically. Holding the lease
       // prevents an idle close from tearing down the repo this write targets;
-      // releasing it (on `using` scope exit) re-arms the idle timer. db.open
-      // awaits any in-flight close, so a commit can never race with a close.
+      // releasing it (on `using` scope exit) re-arms the idle timer. This
+      // awaits any close promise registered by closeRepo or auto-close, so
+      // the commit targets a fully open repo.
       using _lease = await this.db.acquireRepo(repoId);
       const newHead = await _lease.repo.setValueForKey(
         key,

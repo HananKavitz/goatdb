@@ -617,8 +617,8 @@ export class GoatDB<US extends Schema = Schema>
     // Wait for any in-flight open (do not close a half-loaded repo).
     const openP = this._openPromises.get(repoId);
     if (openP) await openP;
-    // The lock guarantees only one caller enters _buildClosePromise at a time,
-    // but double-check: a previous close may have already cleared the repo.
+    // _closeLocks guarantees single-entry. Double-check: a previous close
+    // may have already cleared the repo.
     const repo = this.repository(repoId);
     if (!repo || repo._closeState !== 'open') {
       return;
@@ -1259,25 +1259,41 @@ export class GoatDB<US extends Schema = Schema>
   }
 
   /**
-   * @internal Called by a Repository idle timer. Routes through closeRepo()
-   * which provides the mutex serialization (_closeLocks) and promise
-   * rendezvous (_closePromises/_buildClosePromise), preventing races with
-   * concurrent manual closeRepo() or db.open(). Commits any pending item
-   * edits before teardown — this is safe for auto-close because idle-eligible
-   * repos have no listener-pinned queries or active leases.
+   * @internal Called by a Repository idle timer. Shares the same
+   * serialization primitives as closeRepo() (_closeLocks,
+   * _closePromises) so manual closeRepo and db.open() see the
+   * in-flight close. Does NOT commit pending items or close dependent
+   * queries — pending edits reopen the repo on demand via acquireRepo,
+   * and listener-pinned queries keep repos ineligible for idle close.
    */
   async _requestRepoIdleClose(repo: Repository): Promise<void> {
     if (repo._closeState !== 'open') return;
     if (this.repository(repo.path) !== repo) return; // stale instance
     if (!repo._isIdleEligible()) return;
+    // If manual closeRepo is in-flight, let it handle the close.
+    if (this._closeLocks.has(repo.path)) {
+      const p = this._closePromises.get(repo.path);
+      if (p) await p;
+      return;
+    }
+    // Transition synchronously so concurrent open() and closeRepo()
+    // see the in-flight close before any await.
+    repo._closeState = 'closing';
+    this._closeLocks.add(repo.path);
+    const cp = this._tearDownRepo(repo);
+    this._closePromises.set(repo.path, cp);
     try {
-      await this.closeRepo(repo.path);
+      await cp;
     } catch (e) {
       log({
         severity: 'WARNING',
         error: 'StorageError',
         message: `Auto-close of repo ${repo.path} failed: ${e}`,
       });
+    } finally {
+      this._closePromises.delete(repo.path);
+      this._closeLocks.delete(repo.path);
+      repo._closeState = 'closed';
     }
   }
 

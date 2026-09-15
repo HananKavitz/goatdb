@@ -7,9 +7,9 @@
  *    leases, no external `DocumentChanged` listeners (derived from Emitter's
  *    own registrations via listenerCount), no open dependent queries, and is
  *    not a /sys/ repo.
- *  - Auto-close routes through closeRepo() which commits pending item edits
- *    before teardown. This is safe because idle-eligible repos have no active
- *    leases or listener-pinned queries.
+ *  - Auto-close tears down the repo directly (_tearDownRepo) and does NOT
+ *    call item.commit(). Pending edits reopen the repo on demand via
+ *    acquireRepo (which awaits any in-flight close).
  *  - `db.acquireRepo()` returns a Disposable lease token; releasing it
  *    re-arms the idle timer.
  *  - A formal `open -> closing -> closed` state machine serializes

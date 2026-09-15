@@ -187,7 +187,12 @@ export class Repository<
     // Create idle close timer if configured. The timer is NOT scheduled
     // here: db.open() arms it (_startIdleTimer) only after _openImpl has
     // fully loaded the repo, preventing a slow open from expiring itself.
-    if (this.db.repoInactivityTimeoutMs > 0) {
+    // System repos are never auto-closed, so skip the timer entirely.
+    if (
+      this.db.repoInactivityTimeoutMs > 0 &&
+      !this.path.startsWith('/sys/') &&
+      this.path !== '/sys'
+    ) {
       this._idleTimer = new SimpleTimer(
         this.db.repoInactivityTimeoutMs,
         false,

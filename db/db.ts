@@ -474,7 +474,7 @@ export class GoatDB<US extends Schema = Schema>
     for (const item of [...this._items.values()]) {
       const repoId = itemPathGetRepoId(item.path);
       try {
-        await (item as any).commit();
+        await item.commit();
       } catch (e) {
         log({
           severity: 'WARNING',
@@ -499,7 +499,7 @@ export class GoatDB<US extends Schema = Schema>
     // Deactivate any leftover managed items so their pending commit timers
     // cannot reopen a repo after teardown.
     for (const item of this._items.values()) {
-      (item as any).deactivate();
+      item.deactivate();
     }
     this._items.clear();
   }
@@ -543,7 +543,7 @@ export class GoatDB<US extends Schema = Schema>
     let result = this._openPromises.get(repoId);
     if (!result) {
       result = (async () => {
-        if (closeP) await closeP;
+        if (closeP) await closeP.catch(() => {});
         const again = this._repositories.get(repoId);
         if (again && again._closeState === 'open') {
           return again;
@@ -562,7 +562,8 @@ export class GoatDB<US extends Schema = Schema>
   /**
    * Acquires an open repository and an idle lease that pins it from being
    * auto-closed until the returned RepoLease is disposed (e.g. via a using
-   * block). Reopening waits for any in-flight close to finish.
+   * block or explicit dispose()). Reopening waits for any in-flight close
+   * to finish.
    *
    * @param pathComps A full repository path or path components.
    * @returns A disposable lease; releasing it re-arms the idle timer.
@@ -1258,29 +1259,25 @@ export class GoatDB<US extends Schema = Schema>
   }
 
   /**
-   * @internal Called by a Repository idle timer. Proceeds only when the repo
-   * is idle-eligible (no leases, no DocumentChanged listeners). Transitions
-   * to 'closing', tears down, then 'closed'. Does NOT call item.commit()
-   * — pending edits reopen the repo on demand via acquireRepo.
+   * @internal Called by a Repository idle timer. Routes through closeRepo()
+   * which provides the mutex serialization (_closeLocks) and promise
+   * rendezvous (_closePromises/_buildClosePromise), preventing races with
+   * concurrent manual closeRepo() or db.open(). Commits any pending item
+   * edits before teardown — this is safe for auto-close because idle-eligible
+   * repos have no listener-pinned queries or active leases.
    */
   async _requestRepoIdleClose(repo: Repository): Promise<void> {
     if (repo._closeState !== 'open') return;
     if (this.repository(repo.path) !== repo) return; // stale instance
     if (!repo._isIdleEligible()) return;
-    repo._closeState = 'closing';
-    const cp = this._tearDownRepo(repo);
-    this._closePromises.set(repo.path, cp);
     try {
-      await cp;
+      await this.closeRepo(repo.path);
     } catch (e) {
       log({
         severity: 'WARNING',
         error: 'StorageError',
         message: `Auto-close of repo ${repo.path} failed: ${e}`,
       });
-    } finally {
-      this._closePromises.delete(repo.path);
-      repo._closeState = 'closed';
     }
   }
 
@@ -1472,10 +1469,11 @@ export class GoatDB<US extends Schema = Schema>
 
 /**
  * Disposable lease returned by GoatDB.acquireRepo. Holding it keeps a
- * repository open (its idle timer is unscheduled); releasing it (via a using
- * block or dispose()) re-arms the timer. Used by ManagedItem commits so an
- * in-flight write prevents an idle close from tearing down the target repo;
- * releasing it only updates liveness and reschedules the timer.
+ * repository open (its idle timer is unscheduled); releasing it (via
+ * dispose(), a using block, or Symbol.dispose) re-arms the timer. Used by
+ * ManagedItem commits so an in-flight write prevents an idle close from
+ * tearing down the target repo; releasing it only updates liveness and
+ * reschedules the timer.
  * @group Database
  */
 export class RepoLease implements Disposable {

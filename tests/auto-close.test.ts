@@ -7,8 +7,9 @@
  *    leases, no external `DocumentChanged` listeners (derived from Emitter's
  *    own registrations via listenerCount), no open dependent queries, and is
  *    not a /sys/ repo.
- *  - Auto-close NEVER calls public `item.commit()`. Pending item edits reopen
- *    the repo on demand via `acquireRepo` (which awaits any in-flight close).
+ *  - Auto-close routes through closeRepo() which commits pending item edits
+ *    before teardown. This is safe because idle-eligible repos have no active
+ *    leases or listener-pinned queries.
  *  - `db.acquireRepo()` returns a Disposable lease token; releasing it
  *    re-arms the idle timer.
  *  - A formal `open -> closing -> closed` state machine serializes
@@ -1009,4 +1010,57 @@ export default function setup(): void {
       },
     );
   }
+
+  // ════════════════════════════════════════════════════════════════
+  // Part 11: Auto-Close + Manual Close Serialization
+  // ════════════════════════════════════════════════════════════════
+
+  TEST(
+    'AutoClose',
+    'manual closeRepo awaits in-flight auto-close',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-race-auto-manual', {
+        registry: kRegistry,
+        repoInactivityTimeoutMs: 0, // deterministic hook
+      });
+      try {
+        await db.readyPromise();
+        await db.open('/data/items');
+        assertTrue(p(db)._repositories.has('/data/items'));
+
+        // Fire auto-close via the deterministic hook.
+        const repo = p(db).repository('/data/items');
+        assertExists(repo);
+        const autoCloseP = p(repo)._testTriggerIdleTimeout();
+
+        // While auto-close is in-flight, fire a manual closeRepo.
+        // It must await the auto-close, not race past it.
+        await db.closeRepo('/data/items');
+
+        // Wait for auto-close to also settle.
+        await autoCloseP;
+
+        // Verify: repo is fully torn down — no double state.
+        assertEquals(
+          p(db)._repositories.has('/data/items'),
+          false,
+          'repo fully closed after race',
+        );
+        assertEquals(
+          p(db)._files.has('/data/items'),
+          false,
+          'files entry removed after race',
+        );
+
+        // Verify a subsequent open works cleanly.
+        await db.open('/data/items');
+        assertTrue(
+          p(db)._repositories.has('/data/items'),
+          'reopen works after race resolution',
+        );
+      } finally {
+        await db.close();
+      }
+    },
+  );
 }

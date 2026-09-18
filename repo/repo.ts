@@ -124,6 +124,8 @@ export class Repository<
     string,
     Promise<Commit | undefined>
   >;
+  /** @internal In-flight write promises (setValueForKey + insert) drained by close. */
+  readonly _pendingWrites = new Set<Promise<unknown>>();
   private readonly _cachedCommitsPerUser: Map<string | undefined, string[]>;
   private readonly _commitIsCorruptedResult: Map<string, boolean>;
   private readonly _cachedCommitsWithRecord: Set<string>;
@@ -240,7 +242,7 @@ export class Repository<
    */
   _touchIdle(): void {
     if (!this._idleReady || !this._idleTimer) return;
-    if (this._closeState !== 'open') {
+    if (this._closeState !== 'open' || this.db._isCloseInFlight(this.path)) {
       this._idleTimer.unschedule();
       return;
     }
@@ -283,17 +285,26 @@ export class Repository<
     return true;
   }
 
+  /**
+   * @internal True when a close (manual or auto) is in flight or the repo is
+   * not open. Writes must fail explicitly instead of silently landing on a
+   * repo that is being torn down.
+   */
+  _canWrite(): boolean {
+    return this._closeState === 'open' && !this.db._isCloseInFlight(this.path);
+  }
+
   /** @internal Called by the idle timer to request close. */
   _onIdleTimeout(): void {
     if (!this._isIdleEligible()) return;
-    this.db._requestRepoIdleClose(this as any);
+    this.db._requestRepoIdleClose(this);
   }
 
   /** @internal Test-only: trigger idle close immediately. */
   async _testTriggerIdleTimeout(): Promise<void> {
     this._idleTimer?.unschedule();
     if (!this._isIdleEligible()) return;
-    await this.db._requestRepoIdleClose(this as any);
+    await this.db._requestRepoIdleClose(this);
   }
 
   /**
@@ -1255,6 +1266,7 @@ export class Repository<
     value: Item<S>,
     parentCommit: string | Commit | undefined,
   ): Promise<Commit | undefined> {
+    if (!this._canWrite()) throw serviceUnavailable();
     this._touchIdle();
     assert(
       itemPathIsValid(itemPathJoin(this.path, key)),
@@ -1270,16 +1282,29 @@ export class Repository<
       this.releaseIdleLease();
       throw serviceUnavailable();
     }
-    this._pendingCommitPromises.set(
-      key,
-      this._setValueForKeyImpl(key, value, parentCommit).finally(() => {
-        this._pendingCommitPromises.delete(key);
-        // Release the idle lease after the impl completes (success or
-        // failure), so auto-close is re-enabled.
-        this.releaseIdleLease();
-      }),
-    );
-    return this._pendingCommitPromises.get(key);
+    let p: Promise<Commit | undefined>;
+    p = this._setValueForKeyImpl(key, value, parentCommit).finally(() => {
+      this._pendingCommitPromises.delete(key);
+      this._pendingWrites.delete(p);
+      // Release the idle lease after the impl completes (success or
+      // failure), so auto-close is re-enabled.
+      this.releaseIdleLease();
+    });
+    this._pendingWrites.add(p);
+    this._pendingCommitPromises.set(key, p);
+    return p;
+  }
+
+  /**
+   * @internal Direct commit used by the close flush; bypasses the public close
+   * guard because the target repo is already transitioning to 'closing'.
+   */
+  _setValueForKeyForClose<S extends Schema>(
+    key: string,
+    value: Item<S>,
+    parentCommit: string | Commit | undefined,
+  ): Promise<Commit | undefined> {
+    return this._setValueForKeyImpl(key, value, parentCommit);
   }
 
   private async _setValueForKeyImpl<S extends Schema>(
@@ -1347,62 +1372,73 @@ export class Repository<
    * significantly lower overhead.
    */
   async insert(entries: { key: string; value: Item }[]): Promise<Commit[]> {
+    if (!this._canWrite()) throw serviceUnavailable();
     this._touchIdle();
     // Hold an idle lease during the bulk write so an auto-close cannot tear
     // down the repo between commits.
     this.acquireIdleLease();
+    const p = this._insertImpl(entries);
+    this._pendingWrites.add(p);
     try {
-      const session = this.trustPool.currentSession;
-      const newEntries: { key: string; value: Item }[] = [];
-      const existingPromises: Promise<Commit | undefined>[] = [];
-
-      for (const entry of entries) {
-        if (this.valueForKey(entry.key)) {
-          existingPromises.push(
-            this.setValueForKey(entry.key, entry.value, undefined),
-          );
-        } else {
-          newEntries.push(entry);
-        }
-      }
-
-      // Build root commits for new keys — safe to skip ancestor computation
-      // and delta compression because these are the first commit per key.
-      const commits: Commit[] = [];
-      for (const { key, value } of newEntries) {
-        commits.push(
-          Commit.create({
-            session: session.id,
-            key,
-            contents: value,
-            ancestors: [],
-            orgId: this.orgId,
-          }),
-        );
-      }
-
-      // Sign sequentially (avoids 100k microtask scheduling from Promise.all)
-      if (!this.db.trusted) {
-        for (let i = 0; i < commits.length; i++) {
-          commits[i] = await signCommit(session, commits[i]);
-        }
-      }
-
-      // Persist in one batch
-      if (commits.length > 0) {
-        await this.persistVerifiedCommits(commits);
-      }
-
-      // Await fallback for existing keys
-      const existingResults = await Promise.all(existingPromises);
-      for (const c of existingResults) {
-        if (c) commits.push(c);
-      }
-
-      return commits;
+      return await p;
     } finally {
+      this._pendingWrites.delete(p);
       this.releaseIdleLease();
     }
+  }
+
+  /** @internal Bulk-insert body; tracked by insert() for close-time draining. */
+  private async _insertImpl(
+    entries: { key: string; value: Item }[],
+  ): Promise<Commit[]> {
+    const session = this.trustPool.currentSession;
+    const newEntries: { key: string; value: Item }[] = [];
+    const existingPromises: Promise<Commit | undefined>[] = [];
+
+    for (const entry of entries) {
+      if (this.valueForKey(entry.key)) {
+        existingPromises.push(
+          this.setValueForKey(entry.key, entry.value, undefined),
+        );
+      } else {
+        newEntries.push(entry);
+      }
+    }
+
+    // Build root commits for new keys — safe to skip ancestor computation
+    // and delta compression because these are the first commit per key.
+    const commits: Commit[] = [];
+    for (const { key, value } of newEntries) {
+      commits.push(
+        Commit.create({
+          session: session.id,
+          key,
+          contents: value,
+          ancestors: [],
+          orgId: this.orgId,
+        }),
+      );
+    }
+
+    // Sign sequentially (avoids 100k microtask scheduling from Promise.all)
+    if (!this.db.trusted) {
+      for (let i = 0; i < commits.length; i++) {
+        commits[i] = await signCommit(session, commits[i]);
+      }
+    }
+
+    // Persist in one batch
+    if (commits.length > 0) {
+      await this.persistVerifiedCommits(commits);
+    }
+
+    // Await fallback for existing keys
+    const existingResults = await Promise.all(existingPromises);
+    for (const c of existingResults) {
+      if (c) commits.push(c);
+    }
+
+    return commits;
   }
 
   /**

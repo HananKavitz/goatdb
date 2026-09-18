@@ -16,7 +16,10 @@
  *    close/open, so close/open cannot overlap and a slow open cannot
  *    immediately expire.
  *
- * Tests assert observable lifecycle contracts, not private timer/map state.
+ * Tests assert observable lifecycle contracts through public APIs where one
+ * exists (e.g. `db.repository(path) === undefined`). A few assertions still
+ * read @internal state that has no public equivalent (open-query membership,
+ * the log-file map, close state, idle-ready flag); those are marked in-line.
  * Deterministic hooks (`_testTriggerIdleTimeout`) drive eligibility decisions;
  * only a small E2E layer uses real timers for scheduler integration.
  */
@@ -26,6 +29,8 @@ import { TEST } from './mod.ts';
 import { DataRegistry } from '../cfds/base/data-registry.ts';
 import { isBrowser } from '../base/common.ts';
 import { sleep } from '../base/time.ts';
+import { ServerError } from '../cfds/base/errors.ts';
+import { Item } from '../cfds/base/item.ts';
 import type { Repository } from '../repo/repo.ts';
 
 // ── Test Schema ───────────────────────────────────────────────────
@@ -48,6 +53,23 @@ function p(obj: unknown): any {
 /** Helper: resolve the (possibly re-opened) repository for a path. */
 function repoFor(db: any, repoId: string): Repository | undefined {
   return db.repository(repoId);
+}
+
+/**
+ * Asserts that an async call rejects with a ServerError, i.e. the explicit
+ * `serviceUnavailable()` failure used by the write-during-close guard.
+ */
+async function assertRejectsServiceUnavailable(
+  fn: () => Promise<unknown>,
+  message: string,
+): Promise<void> {
+  let caught: unknown;
+  try {
+    await fn();
+  } catch (e) {
+    caught = e;
+  }
+  assertTrue(caught instanceof ServerError, message);
 }
 
 export default function setup(): void {
@@ -306,32 +328,38 @@ export default function setup(): void {
     }
   });
 
-  TEST('AutoClose', 'repo activity via read resets timer', async (ctx) => {
-    const db = await ctx.createDB('ac-repo-read', {
-      registry: kRegistry,
-      repoInactivityTimeoutMs: 100,
-    });
-    try {
-      await db.readyPromise();
-      let repo = await db.open('/data/items');
-      assertTrue(db.repository('/data/items') !== undefined);
+  TEST(
+    'AutoClose',
+    'repo read activity does not pin the repo (bare repo still closes)',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-repo-read', {
+        registry: kRegistry,
+        repoInactivityTimeoutMs: 100,
+      });
+      try {
+        await db.readyPromise();
+        let repo = await db.open('/data/items');
+        assertTrue(db.repository('/data/items') !== undefined);
 
-      // Touch activity (keys) then attempt idle close -> still closes (bare).
-      repo.keys();
-      await p(repo)._testTriggerIdleTimeout();
-      assertEquals(
-        db.repository('/data/items'),
-        undefined,
-        'repo closed after read+idle',
-      );
+        // A read (keys) touches activity but does not pin the repo:
+        // the deterministic trigger ignores timer age, so this asserts that
+        // reads leave the repo idle-eligible (bare repo still closes).
+        repo.keys();
+        await p(repo)._testTriggerIdleTimeout();
+        assertEquals(
+          db.repository('/data/items'),
+          undefined,
+          'repo closed after read+idle',
+        );
 
-      // Reopen and verify usable.
-      repo = await db.open('/data/items');
-      assertExists(repo);
-    } finally {
-      await db.close();
-    }
-  });
+        // Reopen and verify usable.
+        repo = await db.open('/data/items');
+        assertExists(repo);
+      } finally {
+        await db.close();
+      }
+    },
+  );
 
   // ════════════════════════════════════════════════════════════════
   // Part 3: Query Auto-Close Lifecycle Contracts
@@ -455,7 +483,7 @@ export default function setup(): void {
 
   TEST(
     'AutoClose',
-    'query results() activity resets idle timer',
+    'query results() activity does not pin the query (still closes)',
     async (ctx) => {
       const db = await ctx.createDB('ac-query-read', {
         registry: kRegistry,
@@ -471,7 +499,9 @@ export default function setup(): void {
         await q.loadingFinished();
         const qid = q.id;
 
-        // Reading resets the timer; a single trigger still closes (no listener).
+        // A read (results) touches activity but does not add a listener, so the
+        // query stays idle-eligible and a single deterministic trigger closes
+        // it. (This cannot prove a timer reset: the hook ignores timer age.)
         q.results();
         await p(q)._testTriggerIdleTimeout();
         assertEquals(
@@ -522,7 +552,7 @@ export default function setup(): void {
       const repo = p(db).repository('/data/items');
       if (repo) await p(repo)._testTriggerIdleTimeout();
       assertEquals(
-        p(db)._repositories.has('/data/items'),
+        db.repository('/data/items') !== undefined,
         false,
         'repo closes after q1 closed',
       );
@@ -550,7 +580,7 @@ export default function setup(): void {
 
       await db.closeRepo('/data/items');
       assertEquals(
-        p(db)._repositories.has('/data/items'),
+        db.repository('/data/items') !== undefined,
         false,
         'repo closed',
       );
@@ -558,7 +588,7 @@ export default function setup(): void {
       item.set('value', 'b');
       await item.commit();
       assertTrue(
-        p(db)._repositories.has('/data/items'),
+        db.repository('/data/items') !== undefined,
         'commit() reopened repo',
       );
       assertEquals(item.get('value'), 'b');
@@ -587,7 +617,7 @@ export default function setup(): void {
         const repo = p(db).repository('/data/items');
         if (repo) await p(repo)._testTriggerIdleTimeout();
         assertEquals(
-          p(db)._repositories.has('/data/items'),
+          db.repository('/data/items') !== undefined,
           false,
           'repo auto-closed',
         );
@@ -658,7 +688,7 @@ export default function setup(): void {
 
         assertExists(reopened);
         assertTrue(
-          p(db)._repositories.has('/data/items'),
+          db.repository('/data/items') !== undefined,
           'repo reopened after close',
         );
         assertTrue(reopened !== repo, 'reopened is a fresh instance');
@@ -746,10 +776,10 @@ export default function setup(): void {
         await db.readyPromise();
         const repo = await db.open('/data/items');
         // Attach a listener that pins the repo open
-        const unsub = repo.attach('DocumentChanged', () => {});
+        repo.attach('DocumentChanged', () => {});
         await p(repo)._testTriggerIdleTimeout();
         assertTrue(
-          p(db)._repositories.has('/data/items'),
+          db.repository('/data/items') !== undefined,
           'listener pins repo before detachAll',
         );
 
@@ -759,7 +789,7 @@ export default function setup(): void {
         repo.detachAll('DocumentChanged');
         await p(repo)._testTriggerIdleTimeout();
         assertEquals(
-          p(db)._repositories.has('/data/items'),
+          db.repository('/data/items') !== undefined,
           false,
           'detachAll re-arms timer and repo closes',
         );
@@ -832,7 +862,7 @@ export default function setup(): void {
         assertEquals(r1.status, 'fulfilled', 'first closeRepo ok');
         assertEquals(r2.status, 'fulfilled', 'second closeRepo ok (noop)');
         assertEquals(
-          p(db)._repositories.has('/data/items'),
+          db.repository('/data/items') !== undefined,
           false,
           'repo closed after concurrent calls',
         );
@@ -867,12 +897,16 @@ export default function setup(): void {
           { schema: kAutoCloseSchema, data: { value: 'written-during-lease' } },
           kRegistry,
         );
-        const writeP = (repo as any).setValueForKey('test-key', testItem, undefined);
+        const writeP = (repo as any).setValueForKey(
+          'test-key',
+          testItem,
+          undefined,
+        );
 
         // The lease was acquired synchronously inside setValueForKey.
         await p(repo)._testTriggerIdleTimeout();
         assertTrue(
-          p(db)._repositories.has('/data/items'),
+          db.repository('/data/items') !== undefined,
           'repo pinned by write lease',
         );
         await writeP;
@@ -880,7 +914,7 @@ export default function setup(): void {
         // After write completes, lease is released. Now close is possible.
         await p(repo)._testTriggerIdleTimeout();
         assertEquals(
-          p(db)._repositories.has('/data/items'),
+          db.repository('/data/items') !== undefined,
           false,
           'repo closes after write completes',
         );
@@ -922,7 +956,7 @@ export default function setup(): void {
         const repo = p(db).repository('/data/items');
         if (repo) await p(repo)._testTriggerIdleTimeout();
         assertEquals(
-          p(db)._repositories.has('/data/items'),
+          db.repository('/data/items') !== undefined,
           false,
           'repo auto-closed',
         );
@@ -970,13 +1004,13 @@ export default function setup(): void {
       try {
         await db.readyPromise();
         await db.open('/data/items');
-        assertTrue(p(db)._repositories.has('/data/items'));
+        assertTrue(db.repository('/data/items') !== undefined);
 
         // Poll until the real timer closes the bare repo.
         const deadline = performance.now() + 3000;
         let closed = false;
         while (performance.now() < deadline) {
-          if (!p(db)._repositories.has('/data/items')) {
+          if (db.repository('/data/items') === undefined) {
             closed = true;
             break;
           }
@@ -1001,7 +1035,7 @@ export default function setup(): void {
           await db.open('/data/items');
           await sleep(500);
           assertTrue(
-            p(db)._repositories.has('/data/items'),
+            db.repository('/data/items') !== undefined,
             'repo stays open when disabled',
           );
         } finally {
@@ -1026,37 +1060,343 @@ export default function setup(): void {
       try {
         await db.readyPromise();
         await db.open('/data/items');
-        assertTrue(p(db)._repositories.has('/data/items'));
+        assertTrue(db.repository('/data/items') !== undefined);
 
-        // Fire auto-close via the deterministic hook.
+        // Fire auto-close via the deterministic hook. The hook returns after
+        // the close is registered (state 'closing', teardown in flight).
         const repo = p(db).repository('/data/items');
         assertExists(repo);
         const autoCloseP = p(repo)._testTriggerIdleTimeout();
 
-        // While auto-close is in-flight, fire a manual closeRepo.
-        // It must await the auto-close, not race past it.
+        // While auto-close is in-flight, fire a manual closeRepo. It must await
+        // the auto-close teardown, not race past it.
         await db.closeRepo('/data/items');
 
-        // Wait for auto-close to also settle.
-        await autoCloseP;
-
-        // Verify: repo is fully torn down — no double state.
+        // ORDERING assertion (not eventual state): sample immediately after
+        // closeRepo resolves, BEFORE awaiting autoCloseP. Pre-fix closeRepo
+        // returned early (state still 'closing', file entry still present)
+        // while teardown was in flight; this ordering check fails there and
+        // passes only when closeRepo truly joined the in-flight teardown.
         assertEquals(
-          p(db)._repositories.has('/data/items'),
-          false,
-          'repo fully closed after race',
+          p(repo)._closeState,
+          'closed',
+          'closeRepo awaited the in-flight auto-close teardown',
         );
         assertEquals(
           p(db)._files.has('/data/items'),
           false,
-          'files entry removed after race',
+          'file entry already removed when closeRepo resolved',
         );
+        assertEquals(
+          db.repository('/data/items'),
+          undefined,
+          'repo fully closed after race',
+        );
+
+        // Then confirm the auto-close promise settles too.
+        await autoCloseP;
 
         // Verify a subsequent open works cleanly.
         await db.open('/data/items');
         assertTrue(
-          p(db)._repositories.has('/data/items'),
+          db.repository('/data/items') !== undefined,
           'reopen works after race resolution',
+        );
+      } finally {
+        await db.close();
+      }
+    },
+  );
+
+  // ════════════════════════════════════════════════════════════════
+  // Part 12: Write-During-Close & Close/Open Edge Contracts
+  // ════════════════════════════════════════════════════════════════
+
+  TEST(
+    'AutoClose',
+    'direct repo write begun during auto-close fails explicitly',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-write-during-close', {
+        registry: kRegistry,
+        repoInactivityTimeoutMs: 0, // deterministic hook
+      });
+      try {
+        await db.readyPromise();
+        const repo = await db.open('/data/items');
+        const lateItem = new Item(
+          { schema: kAutoCloseSchema, data: { value: 'late' } },
+          kRegistry,
+        );
+
+        // Start auto-close. The repo transitions to 'closing' synchronously,
+        // so a write begun now lands on a repo whose teardown is in flight.
+        const autoCloseP = p(repo)._testTriggerIdleTimeout();
+
+        // A lease cannot stop an in-flight teardown, so the write path must
+        // fail explicitly instead of resolving and silently losing the write.
+        await assertRejectsServiceUnavailable(
+          () => repo.setValueForKey('late', lateItem, undefined),
+          'setValueForKey during close must throw serviceUnavailable',
+        );
+        await assertRejectsServiceUnavailable(
+          () => repo.insert([{ key: 'late-bulk', value: lateItem }]),
+          'insert during close must throw serviceUnavailable',
+        );
+
+        await autoCloseP;
+        assertEquals(
+          db.repository('/data/items'),
+          undefined,
+          'repo fully closed after rejected writes',
+        );
+
+        // Reopen: nothing was persisted by the rejected writes.
+        const repo2 = await db.open('/data/items');
+        assertEquals(
+          repo2.valueForKey('late'),
+          undefined,
+          'no silent single write',
+        );
+        assertEquals(
+          repo2.valueForKey('late-bulk'),
+          undefined,
+          'no silent bulk write',
+        );
+      } finally {
+        await db.close();
+      }
+    },
+  );
+
+  TEST(
+    'AutoClose',
+    'manual closeRepo drains an in-flight repository write',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-close-inflight-write', {
+        registry: kRegistry,
+        repoInactivityTimeoutMs: 0, // deterministic
+      });
+      try {
+        await db.readyPromise();
+        const repo = await db.open('/data/items');
+        const item = new Item(
+          { schema: kAutoCloseSchema, data: { value: 'inflight' } },
+          kRegistry,
+        );
+
+        // Begin the write while the repo is open and leave it in flight, then
+        // close. The close must drain the pending write before teardown;
+        // otherwise NewCommitSync is detached and the commit never persists.
+        const writeP = repo.setValueForKey('inflight', item, undefined);
+        await db.closeRepo('/data/items');
+        await writeP;
+
+        const repo2 = await db.open('/data/items');
+        const val = repo2.valueForKey('inflight');
+        assertExists(val, 'in-flight write persisted across closeRepo');
+        assertEquals(val[0].get('value'), 'inflight');
+      } finally {
+        await db.close();
+      }
+    },
+  );
+
+  TEST(
+    'AutoClose',
+    'closeRepo settles loadingFinished for a mid-load query',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-close-midload', {
+        registry: kRegistry,
+        repoInactivityTimeoutMs: 0,
+        queryInactivityTimeoutMs: 0,
+      });
+      try {
+        await db.readyPromise();
+        const q = db.query({
+          source: '/data/items',
+          predicate: () => true,
+          schema: kAutoCloseSchema,
+        });
+        // loadingFinished() triggers resume (opens the repo + starts the scan).
+        // Do not await it yet: close the repo while the query is still loading.
+        const loaded = q.loadingFinished();
+        await db.closeRepo('/data/items');
+
+        // loadingFinished() must settle, not hang forever (round-6 finding:
+        // a closed mid-load query never emitted LoadingFinished).
+        const raced = await Promise.race([
+          loaded.then(() => 'loaded' as const),
+          sleep(2000).then(() => 'timeout' as const),
+        ]);
+        assertEquals(
+          raced,
+          'loaded',
+          'loadingFinished() settled after closeRepo closed the repo',
+        );
+        assertEquals(q.loading, false, 'query is no longer loading');
+      } finally {
+        await db.close();
+      }
+    },
+  );
+
+  TEST(
+    'AutoClose',
+    'db.close() racing an in-flight auto-close does not error',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-dbclose-vs-auto', {
+        registry: kRegistry,
+        repoInactivityTimeoutMs: 0, // deterministic hook
+      });
+      await db.readyPromise();
+      const repo = await db.open('/data/items');
+
+      // Trigger auto-close, then immediately close the whole database. The two
+      // teardown paths must serialize through _closeLocks/_closePromises
+      // instead of double-tearing the repo down.
+      const autoCloseP = p(repo)._testTriggerIdleTimeout();
+      await db.close();
+      await autoCloseP;
+
+      assertEquals(
+        db.repository('/data/items'),
+        undefined,
+        'repo closed after db.close() raced auto-close',
+      );
+    },
+  );
+
+  TEST(
+    'AutoClose',
+    'repo.insert acquires an idle lease to prevent mid-write close',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-lease-bulk', {
+        registry: kRegistry,
+        repoInactivityTimeoutMs: 100,
+      });
+      try {
+        await db.readyPromise();
+        const repo = await db.open('/data/items');
+        const entries = [
+          {
+            key: 'bulk-1',
+            value: new Item(
+              { schema: kAutoCloseSchema, data: { value: 'b1' } },
+              kRegistry,
+            ),
+          },
+          {
+            key: 'bulk-2',
+            value: new Item(
+              { schema: kAutoCloseSchema, data: { value: 'b2' } },
+              kRegistry,
+            ),
+          },
+        ];
+
+        // insert() acquires its idle lease synchronously, before any await.
+        const writeP = repo.insert(entries);
+        await p(repo)._testTriggerIdleTimeout();
+        assertTrue(
+          db.repository('/data/items') !== undefined,
+          'bulk insert lease pins the repo open',
+        );
+        await writeP;
+
+        // Lease released -> idle close can proceed.
+        await p(repo)._testTriggerIdleTimeout();
+        assertEquals(
+          db.repository('/data/items'),
+          undefined,
+          'repo closes after the bulk insert completes',
+        );
+
+        // Reopen and verify the bulk write persisted.
+        const repo2 = await db.open('/data/items');
+        assertExists(repo2.valueForKey('bulk-1'), 'bulk-1 persisted');
+        assertExists(repo2.valueForKey('bulk-2'), 'bulk-2 persisted');
+      } finally {
+        await db.flushAll();
+        await db.close();
+      }
+    },
+  );
+
+  TEST(
+    'AutoClose',
+    'db.insert bulk write persists across an auto-close cycle',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-bulk-db-insert', {
+        registry: kRegistry,
+        repoInactivityTimeoutMs: 100,
+      });
+      try {
+        await db.readyPromise();
+        await db.open('/data/items');
+        await db.insert('/data/items', kAutoCloseSchema, [
+          { key: 'db-bulk-1', data: { value: 'x' } },
+          { key: 'db-bulk-2', data: { value: 'y' } },
+        ]);
+
+        const repo = db.repository('/data/items');
+        assertExists(repo);
+        await p(repo)._testTriggerIdleTimeout();
+        assertEquals(
+          db.repository('/data/items'),
+          undefined,
+          'repo auto-closed after db.insert',
+        );
+
+        const repo2 = await db.open('/data/items');
+        assertExists(
+          repo2.valueForKey('db-bulk-1'),
+          'db.insert item persisted',
+        );
+        assertExists(
+          repo2.valueForKey('db-bulk-2'),
+          'db.insert item persisted',
+        );
+      } finally {
+        await db.flushAll();
+        await db.close();
+      }
+    },
+  );
+
+  TEST(
+    'AutoClose',
+    'bare query detachAll() permits idle close',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-query-detachall', {
+        registry: kRegistry,
+        queryInactivityTimeoutMs: 100,
+      });
+      try {
+        await db.readyPromise();
+        const q = db.query({
+          source: '/data/items',
+          predicate: () => true,
+          schema: kAutoCloseSchema,
+        });
+        await q.loadingFinished();
+        const qid = q.id;
+
+        q.attach('DocumentChanged', () => {});
+        await p(q)._testTriggerIdleTimeout();
+        assertTrue(p(db)._openQueries.has(qid), 'listener pins query open');
+
+        // Bare detachAll() (no event arg) must re-evaluate idle state through
+        // the Emitter hook, which receives undefined for the removed event.
+        q.detachAll();
+        await p(q)._testTriggerIdleTimeout();
+        assertTrue(
+          p(q)._closed,
+          'bare detachAll permits the query to close',
+        );
+        assertEquals(
+          p(db)._openQueries.has(qid),
+          false,
+          'closed query is removed from the registry',
         );
       } finally {
         await db.close();

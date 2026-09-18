@@ -541,7 +541,7 @@ export class Query<
   }
 
   /** @internal Test-only: trigger idle close immediately. */
-  async _testTriggerIdleTimeout(): Promise<void> {
+  _testTriggerIdleTimeout(): void {
     this._idleTimer?.unschedule();
     this._onIdleTimeout();
   }
@@ -704,20 +704,6 @@ export class Query<
   }
 
   /**
-   * Closes this query and cleans up its resources. This:
-   * - Emits a 'Closed' event
-   * - Unregisters from query persistence to stop caching
-   * - Removes source change listeners
-   * - Marks the query as closed
-   *
-   * Once closed, a query cannot be reopened. Create a new query instance
-   * instead.
-   *
-   * Callers MUST call close() when a query is no longer needed to release
-   * its event listeners. A FinalizationRegistry safety net exists for the
-   * live-updates listener, but GC timing is non-deterministic.
-   */
-  /**
    * Single hook from Emitter: react to listener changes (attach, detach,
    * detachAll) without overriding each method individually.
    * Covers DocumentChanged to keep the idle timer in sync.
@@ -737,18 +723,37 @@ export class Query<
 
   /**
    * Closes this query, releasing its memory and unregistering from persistence.
-   * Also releases the query's DocumentChanged listener on its source repo,
-   * which may make the source repo eligible for auto-close.
+   * This:
+   * - Settles any pending loading waiters (resolves `loadingFinished()` if the
+   *   query is closed mid-load)
+   * - Emits a 'Closed' event
+   * - Unregisters from query persistence to stop caching
+   * - Removes the query's DocumentChanged listener on its source repo, which
+   *   may make the source repo eligible for auto-close
+   * - Marks the query as closed
    *
    * After close(), the query stops tracking updates and `results()` returns
-   * the snapshot captured at close time. Calling any method on a closed
-   * query is undefined behavior.
+   * the snapshot captured at close time. Calling any method on a closed query
+   * is undefined behavior, and a closed query cannot be reopened -- create a
+   * new query instance instead.
+   *
+   * Callers MUST call close() when a query is no longer needed to release its
+   * event listeners. A FinalizationRegistry safety net exists for the
+   * live-updates listener, but GC timing is non-deterministic.
    */
   close(): void {
     if (!this._closed) {
       this._closed = true;
+      this.repo.db._forgetQuery(this.id, this);
       this._idleTimer?.unschedule();
       this._idleTimer = undefined;
+      // If closed mid-load, settle any loading waiters so a later
+      // loadingFinished() resolves instead of hanging forever.
+      if (!this._loadingFinished) {
+        this._loadingFinished = true;
+        this._loading = false;
+        this.emit('LoadingFinished');
+      }
       this.emit('Closed');
       this.repo.db.queryPersistence?.unregister(
         this as unknown as Query<Schema, Schema, ReadonlyJSONValue>,

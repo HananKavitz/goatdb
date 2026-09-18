@@ -439,6 +439,26 @@ export class ManagedItem<S extends Schema = Schema, US extends Schema = Schema>
   }
 
   /**
+   * @internal Commits the current pending edits directly to a repository that
+   * is being closed. Unlike commit(), this does NOT acquire a repo via
+   * db.acquireRepo/open() (which would await the in-flight close promise and
+   * deadlock); the close pipeline owns the repo's teardown.
+   */
+  async _commitTo(repo: Repository): Promise<void> {
+    const currentDoc = this._item.clone();
+    const key = itemPathGetPart(this.path, 'item')!;
+    const newHead = await repo._setValueForKeyForClose(
+      key,
+      currentDoc,
+      this._head,
+    );
+    if (newHead) {
+      this._head = newHead;
+      this.rebase();
+    }
+  }
+
+  /**
    * Loads the repository and initializes the document by opening the repository
    * and passing it to loadInitialDoc.
    *

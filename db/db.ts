@@ -1,7 +1,11 @@
 import * as path from '../base/path.ts';
 import { log } from '../logging/log.ts';
 import { sessionFromItem, TrustPool } from './session.ts';
-import { Repository, type RepositoryConfig } from '../repo/repo.ts';
+import {
+  Repository,
+  type RepositoryConfig,
+  type RepoStorage,
+} from '../repo/repo.ts';
 import type { DBSettings, DBSettingsProvider } from './settings/settings.ts';
 import { FileSettings } from './settings/file.ts';
 import { Commit } from '../repo/commit.ts';
@@ -479,7 +483,8 @@ export class GoatDB<US extends Schema = Schema>
         log({
           severity: 'WARNING',
           error: 'StorageError',
-          message: `Commit of pending item ${item.path} during close() failed: ${e}`,
+          message:
+            `Commit of pending item ${item.path} during close() failed: ${e}`,
         });
       }
       if (this._repositories.has(repoId)) {
@@ -612,6 +617,13 @@ export class GoatDB<US extends Schema = Schema>
    * Builds the close promise for a repo. Registered in _closePromises before
    * any await so serialization (mutex + promise chain) works correctly:
    * concurrent closeRepo() and open() can properly await the in-flight close.
+   *
+   * The repo's state stays 'open' through the commit phase so concurrent
+   * ManagedItem commits are never blocked on this close promise (which would
+   * otherwise resume after teardown and reopen the repo). New direct writes
+   * are rejected by Repository._canWrite() via GoatDB._isCloseInFlight(), and
+   * pending edits are flushed directly through ManagedItem._commitTo() (not
+   * item.commit(), which would await this close promise via acquireRepo).
    */
   private async _buildClosePromise(repoId: string): Promise<void> {
     // Wait for any in-flight open (do not close a half-loaded repo).
@@ -625,13 +637,16 @@ export class GoatDB<US extends Schema = Schema>
     }
     // Unschedule idle timer so it cannot fire during the close.
     repo._idleTimer?.unschedule();
+    // Wait for writes that began before this close was registered. New writes
+    // are rejected by Repository._canWrite() while the close is in flight, so
+    // this terminates.
+    await this._drainPendingRepoWrites(repo);
     // Tear down dependent queries (manual close owns this; auto-close never
     // reaches here with queries attached because listener pins prevent it).
     this._closeDependentQueries(repoId);
-    // Commit pending item edits before tearing down file handles. This goes
-    // through item.commit() -> acquireRepo -> open(). Since we haven't yet
-    // transitioned to 'closing', open() returns the same repo instance;
-    // no replacement repo race.
+    // Flush pending item edits directly to this closing repo. This deliberately
+    // bypasses item.commit()/acquireRepo, which would deadlock by awaiting the
+    // close promise this method itself is running.
     await this._commitDependentItems(repo);
     for (const k of [...this._items.keys()]) {
       const item = this._items.get(k);
@@ -660,10 +675,22 @@ export class GoatDB<US extends Schema = Schema>
   }
 
   /**
-   * Commits pending item edits for a repo being manually closed. Each
-   * item.commit() is deduped (awaits an in-flight commit or runs now) and
-   * uses acquireRepo so it targets this same 'open' repo -- no db.open()
-   * replacement race.
+   * Waits for writes that began before a manual close was registered. Without
+   * this, an in-flight setValueForKey()/insert() would run after teardown
+   * detaches the NewCommitSync listener and its commit would never reach disk.
+   */
+  private async _drainPendingRepoWrites(repo: Repository): Promise<void> {
+    // New writes are rejected by Repository._canWrite() while the close is in
+    // flight, so this loop terminates.
+    while (repo._pendingWrites.size > 0) {
+      await Promise.allSettled([...repo._pendingWrites]);
+    }
+  }
+
+  /**
+   * Flushes pending item edits for a repo being manually closed. Each item is
+   * committed directly to the closing repo via ManagedItem._commitTo(), which
+   * bypasses acquireRepo/open() so it cannot deadlock on this close promise.
    */
   private async _commitDependentItems(repo: Repository): Promise<void> {
     const items: ManagedItem[] = [];
@@ -674,12 +701,13 @@ export class GoatDB<US extends Schema = Schema>
     }
     for (const item of items) {
       try {
-        await (item.commit() as Promise<void>);
+        await item._commitTo(repo);
       } catch (e) {
         log({
           severity: 'WARNING',
           error: 'StorageError',
-          message: `Commit of pending item ${item.path} during closeRepo() failed: ${e}`,
+          message:
+            `Commit of pending item ${item.path} during closeRepo() failed: ${e}`,
         });
       }
     }
@@ -691,7 +719,9 @@ export class GoatDB<US extends Schema = Schema>
    * NOT commit items and does NOT close dependent queries (callers control
    * that). Caller must have set repo._closeState = 'closing'.
    */
-  private async _tearDownRepo(repo: Repository): Promise<void> {
+  private async _tearDownRepo<ST extends RepoStorage<ST>>(
+    repo: Repository<ST>,
+  ): Promise<void> {
     const repoId = repo.path;
     repo._idleTimer?.unschedule();
     // Flush log file - retry if data was re-queued after a transient failure
@@ -720,7 +750,7 @@ export class GoatDB<US extends Schema = Schema>
     }
     this._files.delete(repoId);
     // Identity guard: a concurrent open() may have installed a fresh repo.
-    if (this._repositories.get(repoId) === repo) {
+    if (Object.is(this._repositories.get(repoId), repo)) {
       this._repositories.delete(repoId);
     }
     this._warnedLegacyRepos.delete(repoId);
@@ -911,14 +941,18 @@ export class GoatDB<US extends Schema = Schema>
         Schema,
         ReadonlyJSONValue
       >;
-      q.once('Closed', () => {
-        if (this._openQueries.get(q!.id) === q) {
-          this._openQueries.delete(q!.id);
-        }
-      });
       this._openQueries.set(id, q);
     }
     return q as unknown as Query<IS, OS, CTX>;
+  }
+
+  /**
+   * @internal Removes a closed query from the open-query registry. Called from
+   * Query.close() so cleanup does not depend on a detachable 'Closed' listener
+   * that a bare detachAll() can remove.
+   */
+  _forgetQuery(id: string, q: unknown): void {
+    if (this._openQueries.get(id) === q) this._openQueries.delete(id);
   }
 
   /**
@@ -1259,6 +1293,15 @@ export class GoatDB<US extends Schema = Schema>
   }
 
   /**
+   * @internal True while any close (manual or auto) is registered for the repo.
+   * Used by Repository._canWrite() to reject writes that would silently land
+   * on a repo whose teardown is already in flight.
+   */
+  _isCloseInFlight(repoId: string): boolean {
+    return this._closeLocks.has(repoId) || this._closePromises.has(repoId);
+  }
+
+  /**
    * @internal Called by a Repository idle timer. Shares the same
    * serialization primitives as closeRepo() (_closeLocks,
    * _closePromises) so manual closeRepo and db.open() see the
@@ -1266,9 +1309,11 @@ export class GoatDB<US extends Schema = Schema>
    * queries — pending edits reopen the repo on demand via acquireRepo,
    * and listener-pinned queries keep repos ineligible for idle close.
    */
-  async _requestRepoIdleClose(repo: Repository): Promise<void> {
+  async _requestRepoIdleClose<ST extends RepoStorage<ST>>(
+    repo: Repository<ST>,
+  ): Promise<void> {
     if (repo._closeState !== 'open') return;
-    if (this.repository(repo.path) !== repo) return; // stale instance
+    if (!Object.is(this.repository(repo.path), repo)) return; // stale instance
     if (!repo._isIdleEligible()) return;
     // If manual closeRepo is in-flight, let it handle the close.
     if (this._closeLocks.has(repo.path)) {
@@ -1280,16 +1325,18 @@ export class GoatDB<US extends Schema = Schema>
     // see the in-flight close before any await.
     repo._closeState = 'closing';
     this._closeLocks.add(repo.path);
-    const cp = this._tearDownRepo(repo);
-    this._closePromises.set(repo.path, cp);
-    try {
-      await cp;
-    } catch (e) {
+    // Resolve the stored promise even on teardown failure so every awaiter
+    // (manual closeRepo included) observes the same, already-logged outcome.
+    const cp = this._tearDownRepo(repo).catch((e) => {
       log({
         severity: 'WARNING',
         error: 'StorageError',
         message: `Auto-close of repo ${repo.path} failed: ${e}`,
       });
+    });
+    this._closePromises.set(repo.path, cp);
+    try {
+      await cp;
     } finally {
       this._closePromises.delete(repo.path);
       this._closeLocks.delete(repo.path);
@@ -1489,20 +1536,24 @@ export class GoatDB<US extends Schema = Schema>
  * dispose(), a using block, or Symbol.dispose) re-arms the timer. Used by
  * ManagedItem commits so an in-flight write prevents an idle close from
  * tearing down the target repo; releasing it only updates liveness and
- * reschedules the timer.
+ * reschedules the timer. dispose() is idempotent: disposing the same lease
+ * more than once does not release another holder's lease.
  * @group Database
  */
 export class RepoLease implements Disposable {
+  private _disposed = false;
   constructor(
     readonly repo: Repository,
     private readonly _release: () => void,
   ) {}
-  /** @internal */
+  /** @internal Idempotent; repeat calls are no-ops. */
   dispose(): void {
+    if (this._disposed) return;
+    this._disposed = true;
     this._release();
   }
   [Symbol.dispose](): void {
-    this._release();
+    this.dispose();
   }
 }
 

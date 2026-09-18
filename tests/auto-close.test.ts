@@ -897,7 +897,7 @@ export default function setup(): void {
           { schema: kAutoCloseSchema, data: { value: 'written-during-lease' } },
           kRegistry,
         );
-        const writeP = (repo as any).setValueForKey(
+        const writeP = repo.setValueForKey(
           'test-key',
           testItem,
           undefined,
@@ -1399,6 +1399,109 @@ export default function setup(): void {
           'closed query is removed from the registry',
         );
       } finally {
+        await db.close();
+      }
+    },
+  );
+
+  // ════════════════════════════════════════════════════════════════
+  // Part 13: Regression - Query cleanup without an open source repo
+  // ════════════════════════════════════════════════════════════════
+  // A query created but never loaded has no open source repo. Query.close()
+  // and Query.suspend() must use the DB's own registry/persistence rather than
+  // dereferencing a missing repo, otherwise a later db.close() rejects with
+  // "Cannot read properties of undefined (reading 'db')".
+  TEST(
+    'AutoClose',
+    'closing an unloaded query does not crash',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-unloaded-close', {
+        registry: kRegistry,
+      });
+      try {
+        await db.readyPromise();
+        const q = db.query({
+          source: '/data/items',
+          predicate: () => true,
+          schema: kAutoCloseSchema,
+        });
+        // Query creation is lazy: it must not open the source repo.
+        assertEquals(
+          db.repository('/data/items'),
+          undefined,
+          'repo not opened by query creation',
+        );
+        q.close();
+        assertTrue(p(q)._closed, 'query closed without an open repo');
+      } finally {
+        await db.close();
+      }
+    },
+  );
+
+  TEST(
+    'AutoClose',
+    'query detach before load does not crash suspend()',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-unloaded-suspend', {
+        registry: kRegistry,
+      });
+      try {
+        await db.readyPromise();
+        const q = db.query({
+          source: '/data/items',
+          predicate: () => true,
+          schema: kAutoCloseSchema,
+        });
+        // Attach then immediately detach the last listener: the emitter goes
+        // inactive and calls suspend() before the repo open completes.
+        const unsub = q.onResultsChanged(() => {});
+        unsub();
+      } finally {
+        await db.close();
+      }
+    },
+  );
+
+  // ════════════════════════════════════════════════════════════════
+  // Part 14: Manual closeRepo must not hand out the closing repo
+  // ════════════════════════════════════════════════════════════════
+  TEST(
+    'AutoClose',
+    'open() during manual closeRepo() never returns the closing repo',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-manual-close-open', {
+        registry: kRegistry,
+      });
+      try {
+        await db.readyPromise();
+        const repo = await db.open('/data/items');
+
+        // Begin a manual close but do not await it. A manual close keeps the
+        // repo's _closeState === 'open' through the commit/flush phase.
+        const closeP = db.closeRepo('/data/items');
+        const reopened = await db.open('/data/items');
+
+        // open() must serialize behind the in-flight close and return a fresh
+        // repo, never the instance that is being torn down.
+        assertTrue(
+          reopened !== repo,
+          'open() must not return the mid-close repo instance',
+        );
+        await closeP;
+        assertExists(
+          db.repository('/data/items'),
+          'repo is open after close+open serialized',
+        );
+
+        // The serially reopened repo must be fully usable.
+        const item = db.create('/data/items/x', kAutoCloseSchema, {
+          value: 'ok',
+        });
+        await item.commit();
+        assertEquals(item.get('value'), 'ok');
+      } finally {
+        await db.flushAll();
         await db.close();
       }
     },

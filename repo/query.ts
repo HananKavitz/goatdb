@@ -744,7 +744,10 @@ export class Query<
   close(): void {
     if (!this._closed) {
       this._closed = true;
-      this.repo.db._forgetQuery(this.id, this);
+      // Use this.db rather than this.repo.db: a query may be closed before it
+      // ever resumed (e.g. created without loadingFinished()), in which case
+      // this.repo is undefined because its source repo was never opened.
+      this.db._forgetQuery(this.id, this);
       this._idleTimer?.unschedule();
       this._idleTimer = undefined;
       // If closed mid-load, settle any loading waiters so a later
@@ -755,7 +758,7 @@ export class Query<
         this.emit('LoadingFinished');
       }
       this.emit('Closed');
-      this.repo.db.queryPersistence?.unregister(
+      this.db.queryPersistence?.unregister(
         this as unknown as Query<Schema, Schema, ReadonlyJSONValue>,
       );
       if (this._sourceListenerCleanup) {
@@ -772,7 +775,9 @@ export class Query<
 
   protected override suspend(): void {
     if (!this._closed) {
-      this.repo.db.queryPersistence?.unregister(
+      // this.db, not this.repo.db: suspend() can run before the source repo is
+      // opened (e.g. a listener is attached and immediately detached).
+      this.db.queryPersistence?.unregister(
         this as unknown as Query<Schema, Schema, ReadonlyJSONValue>,
       );
       // After initial load completes, keep source and live listeners alive

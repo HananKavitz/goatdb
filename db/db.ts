@@ -535,7 +535,15 @@ export class GoatDB<US extends Schema = Schema>
     path = itemPathNormalize(path);
     const repoId = itemPathGetRepoId(path);
     const existing = this._repositories.get(repoId);
-    if (existing && existing._closeState === 'open') {
+    // Only hand out an already-open repo when no close is in flight. During a
+    // manual closeRepo() the state stays 'open' through the commit/flush phase,
+    // so without the _isCloseInFlight() check open() would return the very
+    // instance that is about to be torn down (close/open overlap). Auto-close
+    // sets 'closing' synchronously, but manual close must be guarded here too.
+    if (
+      existing && existing._closeState === 'open' &&
+      !this._isCloseInFlight(repoId)
+    ) {
       existing._touchIdle();
       return Promise.resolve(existing);
     }
@@ -584,6 +592,12 @@ export class GoatDB<US extends Schema = Schema>
   /**
    * Closes a repository, flushing any pending writes to disk before releasing
    * all memory associated with this repository.
+   *
+   * Closes any open queries sourcing from this repository first, then commits
+   * pending item edits, then tears the repository down. Writes that begin after
+   * the close starts are rejected with serviceUnavailable (use `acquireRepo()`
+   * for a lease-pinned write instead). Concurrent `open()` calls wait for the
+   * close to finish before reopening a fresh repository.
    *
    * This method does nothing if the repository isn't currently loaded.
    *

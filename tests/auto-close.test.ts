@@ -1550,4 +1550,51 @@ export default function setup(): void {
       }
     },
   );
+
+  TEST(
+    'AutoClose',
+    'open() during an in-flight open + close never returns the closing repo',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-inflight-open-close', {
+        registry: kRegistry,
+      });
+      try {
+        await db.readyPromise();
+        // Start the open but do NOT await it, so _openPromises holds an entry
+        // when the close is registered behind it.
+        const openA = db.open('/data/items');
+        const closeP = db.closeRepo('/data/items');
+
+        // A concurrent open must not reuse the in-flight open promise: that
+        // promise resolves with the repo the close is about to tear down.
+        // It must wait for the close and return a fresh, usable repo.
+        const reopened = await db.open('/data/items');
+        await closeP;
+
+        assertTrue(
+          reopened !== await openA,
+          'open() must not return the in-flight repo being closed',
+        );
+        assertEquals(
+          p(reopened)._closeState,
+          'open',
+          'reopened repo is open, not the torn-down instance',
+        );
+        assertExists(
+          db.repository('/data/items'),
+          'repo is open after in-flight open + close serialized',
+        );
+
+        // The reopened repo must be fully usable.
+        const item = db.create('/data/items/x', kAutoCloseSchema, {
+          value: 'ok',
+        });
+        await item.commit();
+        assertEquals(item.get('value'), 'ok');
+      } finally {
+        await db.flushAll();
+        await db.close();
+      }
+    },
+  );
 }

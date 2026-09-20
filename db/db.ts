@@ -548,21 +548,20 @@ export class GoatDB<US extends Schema = Schema>
       return Promise.resolve(existing);
     }
     // No open repo, or one mid-close. If a close promise is registered (by
-    // closeRepo or auto-close), await it so the previous repo state is fully
-    // torn down before we open a fresh instance. This replaces the old
-    // mid-close branch that opened a replacement repo while the old close was
-    // still operating -- the race that could delete the replacement file/clients.
+    // closeRepo or auto-close), wait for it so the previous repo state is fully
+    // torn down before we open a fresh instance. This must be checked BEFORE
+    // reusing an in-flight open: when closeRepo() is called while an
+    // _openImpl() is still in flight, that open promise resolves with the very
+    // repo the close is about to tear down, so handing it out would return the
+    // closing instance. Waiting on _closePromises (which itself awaits the
+    // in-flight open) and then reopening is the only safe path.
     const closeP = this._closePromises.get(repoId);
+    if (closeP) {
+      return closeP.catch(() => {}).then(() => this.open(path, opts));
+    }
     let result = this._openPromises.get(repoId);
     if (!result) {
-      result = (async () => {
-        if (closeP) await closeP.catch(() => {});
-        const again = this._repositories.get(repoId);
-        if (again && again._closeState === 'open') {
-          return again;
-        }
-        return this._openImpl(repoId, opts);
-      })().finally(() => {
+      result = this._openImpl(repoId, opts).finally(() => {
         if (this._openPromises.get(repoId) === result) {
           this._openPromises.delete(repoId);
         }

@@ -152,7 +152,7 @@ export interface DBInstanceConfig {
    * to disable. System repos (/sys/) are never auto-closed.
    *
    * When a repo is manually closed via closeRepo(), any open queries
-   * sourcing from it are also closed first (see _closeDependentQueries).
+   * sourcing from it are closed first.
    * Auto-close does NOT close queries — listener pins prevent that.
    *
    * Repo and query timeouts are independent: a query keeps its source
@@ -476,6 +476,9 @@ export class GoatDB<US extends Schema = Schema>
     // callbacks that fired during closeRepo).
     const pendingRepos = new Set<string>();
     for (const item of [...this._items.values()]) {
+      // Skip clean items: committing them would reopen an auto-closed repo
+      // only for _setValueForKeyImpl() to dedup the no-op write.
+      if (!item.isDirty) continue;
       const repoId = itemPathGetRepoId(item.path);
       try {
         await item.commit();
@@ -935,6 +938,18 @@ export class GoatDB<US extends Schema = Schema>
    * Open a new query or access an already open one. Once opened, the query
    * remains open until explicitly closed, and tracks updates to items as they
    * happen.
+   *
+   * Loading is lazy: creating or reading from a query does not start a scan.
+   * Results begin loading on the first subscription ({@link
+   * Query.onResultsChanged}) or when waiting via {@link
+   * Query.loadingFinished}/{@link Query.onLoadingFinished}. Reads
+   * (`results()`, `has()`, `paths()`, ...) are side-effect free and return the
+   * current snapshot only.
+   *
+   * When `queryInactivityTimeoutMs` is set, an unobserved query (no external
+   * `DocumentChanged` listeners) is eligible for auto-close, including one
+   * that never started loading. A closed query is replaced by calling
+   * `db.query()` again.
    *
    * @param config The configuration for the desired query.
    * @returns      A live query instance.
@@ -1559,7 +1574,10 @@ export class RepoLease implements Disposable {
     readonly repo: Repository,
     private readonly _release: () => void,
   ) {}
-  /** @internal Idempotent; repeat calls are no-ops. */
+  /**
+   * Releases the lease. Idempotent: repeat calls are no-ops, so disposing the
+   * same lease more than once never releases another holder's lease.
+   */
   dispose(): void {
     if (this._disposed) return;
     this._disposed = true;

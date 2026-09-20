@@ -46,11 +46,14 @@ const kRegistry = new DataRegistry();
 kRegistry.registerSchema(kAutoCloseSchema);
 
 /** Helper: cast to any for accessing internal fields. */
+// deno-lint-ignore no-explicit-any
 function p(obj: unknown): any {
+  // deno-lint-ignore no-explicit-any
   return obj as any;
 }
 
 /** Helper: resolve the (possibly re-opened) repository for a path. */
+// deno-lint-ignore no-explicit-any
 function repoFor(db: any, repoId: string): Repository | undefined {
   return db.repository(repoId);
 }
@@ -364,6 +367,41 @@ export default function setup(): void {
   // ════════════════════════════════════════════════════════════════
   // Part 3: Query Auto-Close Lifecycle Contracts
   // ════════════════════════════════════════════════════════════════
+
+  TEST(
+    'AutoClose',
+    'unstarted query reports loading=false and is idle-eligible',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-query-unstarted', {
+        registry: kRegistry,
+        queryInactivityTimeoutMs: 100,
+      });
+      try {
+        await db.readyPromise();
+        const q = db.query({
+          source: '/data/items',
+          predicate: () => true,
+          schema: kAutoCloseSchema,
+        });
+        const qid = q.id;
+        // Loading is lazy: a fresh, unobserved query is not "loading".
+        assertEquals(q.loading, false, 'fresh query reports loading=false');
+        assertTrue(p(db)._openQueries.has(qid), 'query open initially');
+
+        await p(q)._testTriggerIdleTimeout();
+        assertEquals(
+          p(db)._openQueries.has(qid),
+          false,
+          'unstarted listenerless query is idle-eligible',
+        );
+        assertTrue(p(q)._closed);
+        // close() settles the loading waiter; this must not hang.
+        await q.loadingFinished();
+      } finally {
+        await db.close();
+      }
+    },
+  );
 
   TEST(
     'AutoClose',
@@ -701,22 +739,50 @@ export default function setup(): void {
 
   TEST(
     'AutoClose',
-    'idle timer is scheduled only after open completes (no slow-open expiry)',
+    'idle timer is armed only after open completes (no slow-open expiry)',
     async (ctx) => {
-      // With a very short timeout, the repo must still be open immediately
-      // after open() resolves (timer armed only post-load, not mid-load).
+      // With a very short timeout, a timer armed mid-load would expire the
+      // repo before open() resolves. Prove the arming order deterministically:
+      // the repo instance is installed while open is still in flight, but the
+      // idle timer must not be armed until the load completes.
       const db = await ctx.createDB('ac-slow-open', {
         registry: kRegistry,
         repoInactivityTimeoutMs: 1,
       });
       try {
         await db.readyPromise();
-        const repo = await db.open('/data/items');
-        assertExists(repo);
-        assertTrue(
-          p(repo)._idleReady === true,
-          'timer armed only after open completes',
+        const openP = db.open('/data/items');
+        // Spin microtasks until _openImpl installs the repo instance, which
+        // happens before its file load (and _startIdleTimer) completes.
+        for (
+          let i = 0;
+          i < 100 && db.repository('/data/items') === undefined;
+          i++
+        ) {
+          await Promise.resolve();
+        }
+        const pending = db.repository('/data/items');
+        assertExists(pending, 'repo installed while open is in flight');
+        assertEquals(
+          p(pending)._idleReady,
+          false,
+          'idle timer not armed until open completes',
         );
+        const repo = await openP;
+        assertEquals(p(repo)._idleReady, true, 'idle timer armed after open');
+        assertTrue(
+          db.repository('/data/items') === repo,
+          'repo is live immediately after open resolves',
+        );
+        // Let the timeout window elapse while pinned: an early-armed timer
+        // would already have closed the repo.
+        const unsub = repo.attach('DocumentChanged', () => {});
+        await sleep(20);
+        assertTrue(
+          db.repository('/data/items') === repo,
+          'pinned repo survived the timeout window',
+        );
+        unsub();
       } finally {
         await db.close();
       }
@@ -818,20 +884,74 @@ export default function setup(): void {
           predicate: () => true,
           schema: kAutoCloseSchema,
         });
-        // _touchIdle is called by accessors even while loading.
-        // It must NOT schedule the timer when _loading is true.
+        // Kick off loading: resume() sets _loading synchronously before it
+        // awaits the open, so a loading query is observable here.
+        const loaded = q.loadingFinished();
+        assertTrue(q.loading, 'scan is in flight after loadingFinished()');
+        // The constructor-armed timer must be unscheduled while loading.
+        assertEquals(
+          p(q)._idleTimer?.isScheduled,
+          false,
+          'idle timer unscheduled while loading',
+        );
+        // A read during loading must neither start loading nor arm the timer.
         q.has('/data/items/nonexistent');
-        // The timer arm was skipped because _loading === true.
-        // Verify by checking that no close happens (query still in map).
         assertTrue(p(db)._openQueries.has(q.id), 'query open during load');
-        await q.loadingFinished();
-        // After loading finishes, the timer arms on next accessor call.
+
+        await loaded;
+        // After loading finishes, the timer arms on the next accessor call.
         // The query has no external listeners -> eligible for close.
         await p(q)._testTriggerIdleTimeout();
         assertEquals(
           p(db)._openQueries.has(q.id),
           false,
           'query closes after loading done + idle',
+        );
+      } finally {
+        await db.close();
+      }
+    },
+  );
+
+  TEST(
+    'AutoClose',
+    'resume() failure clears loading and keeps query reclaimable',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-resume-fail', {
+        registry: kRegistry,
+        queryInactivityTimeoutMs: 100,
+      });
+      try {
+        await db.readyPromise();
+        const q = db.query({
+          source: '/data/items',
+          predicate: () => true,
+          schema: kAutoCloseSchema,
+        });
+        // Force the lazy source open to fail once.
+        const realOpen = db.open.bind(db);
+        let failOnce = true;
+        p(db).open = (path: string, opts?: unknown) => {
+          if (failOnce) {
+            failOnce = false;
+            return Promise.reject(new Error('synthetic open failure'));
+          }
+          return realOpen(path, opts);
+        };
+        // loadingFinished() starts the (failing) load. It must settle rather
+        // than hang, and the query must not stay stuck in "scan in flight".
+        await q.loadingFinished();
+        assertEquals(q.loading, false, 'loading cleared after resume failure');
+        assertEquals(
+          p(q)._idleTimer?.isScheduled,
+          true,
+          'failed query is idle-eligible',
+        );
+        await p(q)._testTriggerIdleTimeout();
+        assertEquals(
+          p(db)._openQueries.has(q.id),
+          false,
+          'failed query is reclaimable',
         );
       } finally {
         await db.close();

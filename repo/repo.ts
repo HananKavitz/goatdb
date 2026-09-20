@@ -137,7 +137,7 @@ export class Repository<
   private readonly _concurrency: number;
   private readonly _authInfoPool: AuthRuleInfo[];
   /** @internal One-shot idle close timer (scheduled only after open completes). */
-  _idleTimer: SimpleTimer | undefined;
+  declare _idleTimer: SimpleTimer | undefined;
   /** @internal Close lifecycle state. db.open() and auto-close check this
    * before transitioning; combined with _closePromises in GoatDB for
    * await-based serialization of Open -> Closing -> Closed. */
@@ -192,8 +192,7 @@ export class Repository<
     // System repos are never auto-closed, so skip the timer entirely.
     if (
       this.db.repoInactivityTimeoutMs > 0 &&
-      !this.path.startsWith('/sys/') &&
-      this.path !== '/sys'
+      !Repository.isSystemRepo(this.path)
     ) {
       this._idleTimer = new SimpleTimer(
         this.db.repoInactivityTimeoutMs,
@@ -228,6 +227,15 @@ export class Repository<
   }
 
   /**
+   * True when the given repository path belongs to the system namespace
+   * (`/sys` or `/sys/*`). System repositories are exempt from inactivity
+   * auto-close.
+   */
+  static isSystemRepo(path: string): boolean {
+    return path === '/sys' || path.startsWith('/sys/');
+  }
+
+  /**
    * @internal Called by db.open() after the repo is fully loaded. Arms the idle
    * timer for the first time, so a slow open cannot immediately expire.
    */
@@ -237,10 +245,10 @@ export class Repository<
   }
 
   /**
-   * Resets the idle close timer on activity. The timer only runs while the
-   * repo is fully open, idle, and unpinned by leases or listeners.
+   * @internal Resets the idle close timer on activity. The timer only runs
+   * while the repo is fully open, idle, and unpinned by leases or listeners.
    */
-  _touchIdle(): void {
+  override _touchIdle(): void {
     if (!this._idleReady || !this._idleTimer) return;
     if (this._closeState !== 'open' || this.db._isCloseInFlight(this.path)) {
       this._idleTimer.unschedule();
@@ -281,7 +289,7 @@ export class Repository<
     if (this._idleLeaseCount > 0) return false;
     if (this.listenerCount('DocumentChanged') > 0) return false;
     // System repos are never auto-closed
-    if (this.path.startsWith('/sys/') || this.path === '/sys') return false;
+    if (Repository.isSystemRepo(this.path)) return false;
     return true;
   }
 
@@ -297,7 +305,16 @@ export class Repository<
   /** @internal Called by the idle timer to request close. */
   _onIdleTimeout(): void {
     if (!this._isIdleEligible()) return;
-    this.db._requestRepoIdleClose(this);
+    // Fire-and-forget, but never leave the promise unobserved: the lock branch
+    // of _requestRepoIdleClose() awaits a manual close promise that may
+    // rethrow a teardown failure.
+    void this.db._requestRepoIdleClose(this).catch((e) => {
+      log({
+        severity: 'WARNING',
+        error: 'StorageError',
+        message: `Auto-close of repo ${this.path} failed: ${e}`,
+      });
+    });
   }
 
   /** @internal Test-only: trigger idle close immediately. */
@@ -305,24 +322,6 @@ export class Repository<
     this._idleTimer?.unschedule();
     if (!this._isIdleEligible()) return;
     await this.db._requestRepoIdleClose(this);
-  }
-
-  /**
-   * Single hook from Emitter: react to listener changes (attach, detach,
-   * detachAll) without overriding each method individually.
-   * Covers DocumentChanged to keep the idle timer in sync.
-   */
-  protected override _onListenersChanged(event: string | undefined): void {
-    // Handle both specific 'DocumentChanged' changes and bare detachAll()
-    // (which passes undefined). In either case, re-evaluate the idle state.
-    if (event === 'DocumentChanged' || event === undefined) {
-      const count = this.listenerCount('DocumentChanged');
-      if (count > 0) {
-        this._idleTimer?.unschedule();
-      } else {
-        this._touchIdle();
-      }
-    }
   }
 
   get orgId(): string {

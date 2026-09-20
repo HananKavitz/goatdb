@@ -17,6 +17,12 @@ export class Emitter<T extends string> {
   private _isActive: boolean;
   private _dispatching = 0;
   private _dispatchDirty = false;
+  /**
+   * Optional one-shot idle timer owned by subclasses (Repository, Query) that
+   * implement inactivity auto-close. The shared listener hook below keeps it
+   * unscheduled whenever a DocumentChanged listener is registered.
+   */
+  protected _idleTimer?: Timer;
 
   constructor(
     delayedEmissionTimerConstructor?: (callback: TimerCallback) => Timer,
@@ -307,12 +313,29 @@ export class Emitter<T extends string> {
 
   /**
    * Hook called whenever listeners change for a specific event (attach, detach,
-   * or detachAll with a specific event). Override in subclasses to react to
-   * listener changes (e.g. re-arm idle timers) without overriding attach/detach
-   * individually. The event argument is the event whose listener set changed,
-   * or undefined for detachAll() with no argument.
+   * or detachAll). The event argument is the event whose listener set changed,
+   * or undefined for detachAll() with no argument. The default implementation
+   * keeps a subclass-owned `_idleTimer` in sync with DocumentChanged pins;
+   * `_touchIdle()` is the subclass-specific reset policy.
    */
-  protected _onListenersChanged(_event: string | undefined): void {}
+  protected _onListenersChanged(event: string | undefined): void {
+    if (event === 'DocumentChanged' || event === undefined) {
+      // Widened to string: concrete subclasses (Repository, Query) include
+      // 'DocumentChanged' in their event union.
+      const count = (this as Emitter<string>).listenerCount('DocumentChanged');
+      if (count > 0) {
+        this._idleTimer?.unschedule();
+      } else {
+        this._touchIdle();
+      }
+    }
+  }
+
+  /**
+   * Idle-timer reset hook. Subclasses that own an `_idleTimer` override this;
+   * the default is a no-op.
+   */
+  protected _touchIdle(): void {}
 
   protected suspend(): void {}
 

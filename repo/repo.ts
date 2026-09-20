@@ -125,7 +125,7 @@ export class Repository<
     Promise<Commit | undefined>
   >;
   /** @internal In-flight write promises (setValueForKey + insert) drained by close. */
-  readonly _pendingWrites = new Set<Promise<unknown>>();
+  readonly _pendingWrites: Set<Promise<unknown>> = new Set();
   private readonly _cachedCommitsPerUser: Map<string | undefined, string[]>;
   private readonly _commitIsCorruptedResult: Map<string, boolean>;
   private readonly _cachedCommitsWithRecord: Set<string>;
@@ -1282,8 +1282,7 @@ export class Repository<
       this.releaseIdleLease();
       throw serviceUnavailable();
     }
-    let p: Promise<Commit | undefined>;
-    p = this._setValueForKeyImpl(key, value, parentCommit).finally(() => {
+    const p = this._setValueForKeyImpl(key, value, parentCommit).finally(() => {
       this._pendingCommitPromises.delete(key);
       this._pendingWrites.delete(p);
       // Release the idle lease after the impl completes (success or

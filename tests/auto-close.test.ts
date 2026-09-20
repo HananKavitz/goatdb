@@ -1441,6 +1441,50 @@ export default function setup(): void {
 
   TEST(
     'AutoClose',
+    'close during load does not leak the source listener',
+    async (ctx) => {
+      const db = await ctx.createDB('ac-close-during-load', {
+        registry: kRegistry,
+        repoInactivityTimeoutMs: 100,
+      });
+      try {
+        await db.readyPromise();
+        const q = db.query({
+          source: '/data/items',
+          predicate: () => true,
+          schema: kAutoCloseSchema,
+        });
+        // Start loading (resume() -> await db.open()) and close mid-load.
+        const loaded = q.loadingFinished();
+        q.close();
+        await loaded;
+
+        // Await the same in-flight open that resume() is waiting on. resume()
+        // registered its continuation first, so its post-await code has run by
+        // the time this resolves.
+        const repo = await db.open('/data/items');
+        assertEquals(
+          repo.listenerCount('DocumentChanged'),
+          0,
+          'close during load must not leak the source listener',
+        );
+
+        // With no leaked listener the repo is idle-eligible and auto-closes;
+        // a leaked listener would pin it open forever.
+        await p(repo)._testTriggerIdleTimeout();
+        assertEquals(
+          db.repository('/data/items'),
+          undefined,
+          'repo auto-closes after close-during-load',
+        );
+      } finally {
+        await db.close();
+      }
+    },
+  );
+
+  TEST(
+    'AutoClose',
     'query detach before load does not crash suspend()',
     async (ctx) => {
       const db = await ctx.createDB('ac-unloaded-suspend', {

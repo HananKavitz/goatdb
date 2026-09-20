@@ -674,6 +674,12 @@ export class Query<
       if (typeof this.source === 'string') {
         await this.db.open(this.source);
       }
+      // close() may have run while we awaited the open. If so, do NOT scan or
+      // attach the source/live listeners: close() already cleaned up (an
+      // as-yet-unset) _sourceListenerCleanup, so attaching now would leak a
+      // DocumentChanged listener that pins the repo open forever and defeats
+      // idle auto-close.
+      if (this._closed) return;
       this.scanRepo();
       if (!this._sourceListenerCleanup) {
         // Repo emits the plain item key; a chained Query emits the full path.

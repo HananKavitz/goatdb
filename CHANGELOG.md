@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `DBInstanceConfig.repoInactivityTimeoutMs` and
+  `queryInactivityTimeoutMs` auto-close idle repositories and queries. Both
+  default to `0` (disabled). A repository closes only when it has no in-flight
+  leases, no external `DocumentChanged` listeners, and no open dependent
+  queries; `/sys/` repositories are exempt.
+
 ## [0.6.1] - 2026-09-01
 
 ### Fixed
